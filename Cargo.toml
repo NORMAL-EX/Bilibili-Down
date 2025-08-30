@@ -27,6 +27,14 @@ rfd = "0.15"
 env_logger = "0.11"
 uuid = { version = "1.11", features = ["v4"] }
 aria2-ws = "0.2"
+winreg = "0.52"
 
 [target.'cfg(windows)'.dependencies]
-winreg = "0.52"
+winapi = { version = "0.3", features = [
+    "tlhelp32",
+    "processthreadsapi", 
+    "handleapi",
+    "winnt",
+    "minwindef",
+    "winbase"
+]}

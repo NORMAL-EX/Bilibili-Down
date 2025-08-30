@@ -644,6 +644,7 @@ dependencies = [
  "tokio",
  "url",
  "uuid",
+ "winapi",
  "winreg",
 ]
 

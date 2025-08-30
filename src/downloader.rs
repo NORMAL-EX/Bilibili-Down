@@ -10,6 +10,44 @@ use aria2_ws::{Client as Aria2Client, TaskOptions};
 use aria2_ws::response::TaskStatus;
 use serde_json::json;
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+#[cfg(target_os = "windows")]
+use winapi::{
+    um::{
+        tlhelp32::{CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS},
+        processthreadsapi::{OpenProcess, TerminateProcess},
+        handleapi::CloseHandle,
+        winnt::PROCESS_TERMINATE,
+    },
+    shared::minwindef::DWORD,
+};
+
+#[cfg(target_os = "windows")]
+use std::os::windows::ffi::OsStringExt;
+
+#[cfg(debug_assertions)]
+macro_rules! debug_println {
+    ($($arg:tt)*) => { println!($($arg)*) }
+}
+#[cfg(not(debug_assertions))]
+macro_rules! debug_println {
+    ($($arg:tt)*) => {}
+}
+
+#[cfg(debug_assertions)]
+macro_rules! debug_eprintln {
+    ($($arg:tt)*) => { eprintln!($($arg)*) }
+}
+#[cfg(not(debug_assertions))]
+macro_rules! debug_eprintln {
+    ($($arg:tt)*) => {}
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum DownloadStatus {
     Waiting,
@@ -91,11 +129,9 @@ impl DownloadManager {
             aria2_process: None,
         };
         
-        // 启动aria2和连接
         manager.start_aria2();
         manager.connect_aria2();
         
-        // 启动状态更新任务
         let tasks = manager.tasks.clone();
         let aria2_client = manager.aria2_client.clone();
         runtime.spawn(async move {
@@ -108,26 +144,72 @@ impl DownloadManager {
         manager
     }
     
+    #[cfg(target_os = "windows")]
+    fn kill_processes_by_name(process_name: &str) {
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snapshot == winapi::um::handleapi::INVALID_HANDLE_VALUE {
+                return;
+            }
+            
+            let mut process_entry: PROCESSENTRY32 = std::mem::zeroed();
+            process_entry.dwSize = std::mem::size_of::<PROCESSENTRY32>() as DWORD;
+            
+            if Process32First(snapshot, &mut process_entry) != 0 {
+                loop {
+                    // 修复类型转换问题：从 CHAR (i8) 数组转换为 u16 Vec
+                    let exe_name_wide: Vec<u16> = process_entry.szExeFile
+                        .iter()
+                        .take_while(|&&c| c != 0)
+                        .map(|&c| c as u8 as u16)
+                        .collect();
+                    
+                    let exe_name = std::ffi::OsString::from_wide(&exe_name_wide);
+                    
+                    if let Some(exe_str) = exe_name.to_str() {
+                        if exe_str.eq_ignore_ascii_case(process_name) {
+                            let process_handle = OpenProcess(
+                                PROCESS_TERMINATE,
+                                0,
+                                process_entry.th32ProcessID
+                            );
+                            
+                            if !process_handle.is_null() {
+                                TerminateProcess(process_handle, 101);
+                                CloseHandle(process_handle);
+                                debug_println!("终止进程: {} (PID: {})", exe_str, process_entry.th32ProcessID);
+                            }
+                        }
+                    }
+                    
+                    if Process32Next(snapshot, &mut process_entry) == 0 {
+                        break;
+                    }
+                }
+            }
+            
+            CloseHandle(snapshot);
+        }
+    }
+    
+    #[cfg(not(target_os = "windows"))]
+    fn kill_processes_by_name(_process_name: &str) {
+        // 非Windows平台暂不实现
+    }
+    
     fn start_aria2(&mut self) {
         let aria2_path = Self::get_aria2_path();
         
         if !aria2_path.exists() {
-            eprintln!("警告: aria2c 未找到！");
-            eprintln!("请下载 aria2c 并放置到: {:?}", aria2_path);
+            debug_eprintln!("警告: aria2c 未找到！");
+            debug_eprintln!("请下载 aria2c 并放置到: {:?}", aria2_path);
             return;
         }
         
-        // 杀死已存在的aria2进程
-        #[cfg(target_os = "windows")]
-        {
-            let _ = Command::new("taskkill")
-                .args(&["/F", "/IM", "aria2c.exe"])
-                .output();
-        }
+        Self::kill_processes_by_name("aria2c.exe");
         
         std::thread::sleep(std::time::Duration::from_millis(500));
         
-        // 启动aria2c
         let mut cmd = Command::new(&aria2_path);
         cmd.arg("--enable-rpc")
             .arg("--rpc-listen-all=false")
@@ -144,14 +226,19 @@ impl DownloadManager {
             .arg("--check-certificate=false")
             .arg("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
         
+        #[cfg(target_os = "windows")]
+        {
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        
         match cmd.spawn() {
             Ok(child) => {
-                println!("aria2c 启动成功，PID: {:?}", child.id());
+                debug_println!("aria2c 启动成功，PID: {:?}", child.id());
                 self.aria2_process = Some(child);
                 std::thread::sleep(std::time::Duration::from_secs(2));
             }
             Err(e) => {
-                eprintln!("无法启动 aria2c: {}", e);
+                debug_eprintln!("无法启动 aria2c: {}", e);
             }
         }
     }
@@ -167,15 +254,15 @@ impl DownloadManager {
             loop {
                 match Aria2Client::connect("ws://localhost:6800/jsonrpc", None).await {
                     Ok(client) => {
-                        println!("成功连接到 aria2 RPC");
+                        debug_println!("成功连接到 aria2 RPC");
                         *aria2_client.write() = Some(client);
                         break;
                     }
                     Err(e) => {
                         retry_count += 1;
-                        eprintln!("连接aria2失败 (尝试 {}/{}): {}", retry_count, max_retries, e);
+                        debug_eprintln!("连接aria2失败 (尝试 {}/{}): {}", retry_count, max_retries, e);
                         if retry_count >= max_retries {
-                            eprintln!("无法连接到 aria2 RPC");
+                            debug_eprintln!("无法连接到 aria2 RPC");
                             break;
                         }
                         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -224,7 +311,6 @@ impl DownloadManager {
                         let mut has_error = false;
                         let mut error_msg = String::new();
                         
-                        // 检查视频下载状态
                         if let Some(gid) = video_gid {
                             match client.tell_status(gid).await {
                                 Ok(status) => {
@@ -259,7 +345,6 @@ impl DownloadManager {
                             }
                         }
                         
-                        // 检查音频下载状态
                         if has_audio {
                             if let Some(gid) = audio_gid {
                                 match client.tell_status(gid).await {
@@ -298,7 +383,6 @@ impl DownloadManager {
                             audio_progress = 1.0;
                         }
                         
-                        // 更新任务状态
                         let status_arc = {
                             let task_read = task.read();
                             task_read.status.clone()
@@ -382,7 +466,6 @@ impl DownloadManager {
         let aria2_client = self.aria2_client.clone();
         
         self.runtime.spawn(async move {
-            // 延迟启动确保aria2准备就绪
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
             Self::download_task(task, download_path, bilibili_api, aria2_client).await;
         });
@@ -399,18 +482,17 @@ impl DownloadManager {
             (t.id.clone(), t.title.clone(), t.is_mp3, t.quality, t.cid)
         };
         
-        println!("开始下载任务: BV={}, 标题={}, 质量={}", id, title, quality);
+        debug_println!("开始下载任务: BV={}, 标题={}, 质量={}", id, title, quality);
         
         *task.write().status.write() = DownloadStatus::Downloading {
             progress: 0.0,
             speed: "获取下载地址...".to_string(),
         };
         
-        // 获取下载URL
-        println!("正在获取视频下载地址...");
+        debug_println!("正在获取视频下载地址...");
         match bilibili_api.get_download_urls(&id, cid, quality).await {
             Ok((video_url, audio_url)) => {
-                println!("成功获取下载地址");
+                debug_println!("成功获取下载地址");
                 
                 let safe_title = Self::sanitize_filename(&title);
                 let video_file = download_path.join(format!("{}_video.m4s", safe_title));
@@ -421,11 +503,9 @@ impl DownloadManager {
                     download_path.join(format!("{}.mp4", safe_title))
                 };
                 
-                // 检查是否有音频
                 let has_audio = video_url != audio_url;
                 task.write().has_audio = has_audio;
                 
-                // 等待客户端连接
                 let mut retry_count = 0;
                 while aria2_client.read().is_none() && retry_count < 10 {
                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -438,7 +518,6 @@ impl DownloadManager {
                 };
                 
                 if let Some(client) = client {
-                    // 准备下载选项
                     let options = TaskOptions {
                         dir: Some(download_path.to_string_lossy().to_string()),
                         out: Some(video_file.file_name().unwrap().to_string_lossy().to_string()),
@@ -462,42 +541,39 @@ impl DownloadManager {
                         ..Default::default()
                     };
                     
-                    // 添加视频下载任务
-                    println!("添加视频下载任务到aria2...");
+                    debug_println!("添加视频下载任务到aria2...");
                     match client.add_uri(vec![video_url.clone()], Some(options.clone()), None, None).await {
                         Ok(gid) => {
-                            println!("视频下载任务已添加，GID: {}", gid);
+                            debug_println!("视频下载任务已添加，GID: {}", gid);
                             task.write().video_gid = Some(gid.clone());
                             task.write().video_path = Some(video_file.clone());
                             
-                            // 如果有独立的音频流，添加音频下载
                             if has_audio {
                                 let mut audio_options = options.clone();
                                 audio_options.out = Some(audio_file.file_name().unwrap().to_string_lossy().to_string());
                                 
-                                println!("添加音频下载任务到aria2...");
+                                debug_println!("添加音频下载任务到aria2...");
                                 match client.add_uri(vec![audio_url.clone()], Some(audio_options), None, None).await {
                                     Ok(audio_gid) => {
-                                        println!("音频下载任务已添加，GID: {}", audio_gid);
+                                        debug_println!("音频下载任务已添加，GID: {}", audio_gid);
                                         task.write().audio_gid = Some(audio_gid.clone());
                                         task.write().audio_path = Some(audio_file.clone());
                                     }
                                     Err(e) => {
-                                        eprintln!("添加音频下载失败: {}", e);
+                                        debug_eprintln!("添加音频下载失败: {}", e);
                                         *task.write().status.write() = DownloadStatus::Failed(format!("添加音频下载失败: {}", e));
                                         return;
                                     }
                                 }
                             }
                             
-                            // 等待下载完成
                             loop {
                                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                                 
                                 let status = task.read().status.read().clone();
                                 match status {
                                     DownloadStatus::Merging { .. } => {
-                                        println!("下载完成，开始合并文件...");
+                                        debug_println!("下载完成，开始合并文件...");
                                         break;
                                     }
                                     DownloadStatus::Failed(_) => {
@@ -507,7 +583,6 @@ impl DownloadManager {
                                 }
                             }
                             
-                            // 执行合并
                             let merge_success = if has_audio {
                                 Self::merge_audio_video(&video_file, &audio_file, &output_file, is_mp3).await
                             } else {
@@ -515,8 +590,7 @@ impl DownloadManager {
                             };
                             
                             if merge_success {
-                                println!("文件处理成功: {:?}", output_file);
-                                // 清理临时文件
+                                debug_println!("文件处理成功: {:?}", output_file);
                                 let _ = std::fs::remove_file(&video_file);
                                 if has_audio {
                                     let _ = std::fs::remove_file(&audio_file);
@@ -525,22 +599,22 @@ impl DownloadManager {
                                 task.write().output_path = Some(output_file);
                                 *task.write().status.write() = DownloadStatus::Completed;
                             } else {
-                                eprintln!("合并文件失败");
+                                debug_eprintln!("合并文件失败");
                                 *task.write().status.write() = DownloadStatus::Failed("合并音视频失败".to_string());
                             }
                         }
                         Err(e) => {
-                            eprintln!("添加视频下载任务失败: {}", e);
+                            debug_eprintln!("添加视频下载任务失败: {}", e);
                             *task.write().status.write() = DownloadStatus::Failed(format!("添加下载失败: {}", e));
                         }
                     }
                 } else {
-                    eprintln!("aria2客户端未连接");
+                    debug_eprintln!("aria2客户端未连接");
                     *task.write().status.write() = DownloadStatus::Failed("aria2客户端未连接".to_string());
                 }
             }
             Err(e) => {
-                eprintln!("获取下载地址失败: {}", e);
+                debug_eprintln!("获取下载地址失败: {}", e);
                 *task.write().status.write() = DownloadStatus::Failed(format!("获取下载地址失败: {}", e));
             }
         }
@@ -550,11 +624,11 @@ impl DownloadManager {
         let ffmpeg_path = Self::get_ffmpeg_path();
         
         if !ffmpeg_path.exists() {
-            eprintln!("ffmpeg未找到: {:?}", ffmpeg_path);
+            debug_eprintln!("ffmpeg未找到: {:?}", ffmpeg_path);
             return false;
         }
         
-        println!("使用ffmpeg合并文件...");
+        debug_println!("使用ffmpeg合并文件...");
         
         let mut cmd = Command::new(ffmpeg_path);
         
@@ -572,18 +646,23 @@ impl DownloadManager {
         cmd.arg("-y")
             .arg(output_path.to_string_lossy().to_string());
         
+        #[cfg(target_os = "windows")]
+        {
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        
         match cmd.output() {
             Ok(output) => {
                 if output.status.success() {
-                    println!("ffmpeg合并成功");
+                    debug_println!("ffmpeg合并成功");
                     true
                 } else {
-                    eprintln!("ffmpeg执行失败: {}", String::from_utf8_lossy(&output.stderr));
+                    debug_eprintln!("ffmpeg执行失败: {}", String::from_utf8_lossy(&output.stderr));
                     false
                 }
             }
             Err(e) => {
-                eprintln!("运行ffmpeg失败: {}", e);
+                debug_eprintln!("运行ffmpeg失败: {}", e);
                 false
             }
         }

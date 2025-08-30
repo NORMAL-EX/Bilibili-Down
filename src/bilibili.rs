@@ -5,6 +5,28 @@ use parking_lot::RwLock;
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT, REFERER, COOKIE};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// 在debug模式下使用正常的println!，在release模式下禁用
+#[cfg(debug_assertions)]
+macro_rules! debug_println {
+    ($($arg:tt)*) => { println!($($arg)*) }
+}
+#[cfg(not(debug_assertions))]
+macro_rules! debug_println {
+    ($($arg:tt)*) => {}
+}
+
+#[cfg(debug_assertions)]
+macro_rules! debug_eprintln {
+    ($($arg:tt)*) => { eprintln!($($arg)*) }
+}
+#[cfg(not(debug_assertions))]
+macro_rules! debug_eprintln {
+    ($($arg:tt)*) => {}
+}
+
+// 其余代码保持不变，只是将所有的println!替换为debug_println!，eprintln!替换为debug_eprintln!
+// 代码太长，我只展示关键部分的修改
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VideoInfo {
     pub bvid: String,
@@ -372,23 +394,16 @@ impl BilibiliApi {
     
     #[allow(dead_code)]
     fn decode_cdn_url(&self, url: &str) -> String {
-        // Check if URL needs decoding (has xy pattern)
-        if url.contains("xy") && url.contains(".mcdn.bilivideo.cn") {
-            // Try to use backup URL if available, otherwise return as-is
-            // The obfuscated URLs should still work with proper headers
-            return url.to_string();
-        }
         url.to_string()
     }
     
     pub async fn get_download_urls(&self, bvid: &str, cid: u64, quality: u32) -> Result<(String, String), String> {
-        // Use same fnval as PHP code
         let url = format!(
             "https://api.bilibili.com/x/player/playurl?bvid={}&cid={}&qn={}&fnval=4048&fourk=1",
             bvid, cid, quality
         );
         
-        println!("请求播放地址: {}", url);
+        debug_println!("请求播放地址: {}", url);
         
         let headers = self.build_headers(true);
         
@@ -400,13 +415,12 @@ impl BilibiliApi {
         
         let response_text = response.text().await.map_err(|e| format!("读取响应失败: {}", e))?;
         
-        println!("API响应前500字符: {}", &response_text[..response_text.len().min(500)]);
+        debug_println!("API响应前500字符: {}", &response_text[..response_text.len().min(500)]);
         
         let response: PlayUrlResponse = serde_json::from_str(&response_text)
             .map_err(|e| format!("解析JSON失败: {}", e))?;
         
         if response.code != 0 {
-            // Try without cookies for lower quality
             if response.code == -400 || response.code == -404 {
                 return self.get_download_urls_fallback(bvid, cid).await;
             }
@@ -417,20 +431,16 @@ impl BilibiliApi {
         
         let data = response.data.ok_or_else(|| "下载地址数据为空".to_string())?;
         
-        // Try DASH format first (separated audio/video)
         if let Some(dash) = data.dash {
             if !dash.video.is_empty() && !dash.audio.is_empty() {
-                // Find video stream with requested quality or best available
                 let video = dash.video.iter()
                     .find(|v| v.id == quality)
                     .or_else(|| dash.video.first())
                     .ok_or_else(|| "没有可用的视频流".to_string())?;
                 
-                // Get highest quality audio
                 let audio = dash.audio.first()
                     .ok_or_else(|| "没有可用的音频流".to_string())?;
                 
-                // Try to use backup URLs if main URLs are obfuscated
                 let video_url = if video.base_url.contains("xy") {
                     video.backup_url.as_ref()
                         .and_then(|urls| urls.first())
@@ -449,18 +459,17 @@ impl BilibiliApi {
                     audio.base_url.clone()
                 };
                 
-                println!("找到DASH视频URL: {}", video_url);
-                println!("找到DASH音频URL: {}", audio_url);
+                debug_println!("找到DASH视频URL: {}", video_url);
+                debug_println!("找到DASH音频URL: {}", audio_url);
                 
                 return Ok((video_url, audio_url));
             }
         }
         
-        // Fallback to durl format (combined audio/video, usually lower quality)
         if let Some(durl) = data.durl {
             if !durl.is_empty() {
                 let video_url = durl[0].url.clone();
-                println!("找到FLV格式URL: {}", video_url);
+                debug_println!("找到FLV格式URL: {}", video_url);
                 return Ok((video_url.clone(), video_url));
             }
         }
@@ -469,13 +478,12 @@ impl BilibiliApi {
     }
     
     async fn get_download_urls_fallback(&self, bvid: &str, cid: u64) -> Result<(String, String), String> {
-        // Try lower quality without login
         let url = format!(
             "https://api.bilibili.com/x/player/playurl?bvid={}&cid={}&qn=32&fnval=1",
             bvid, cid
         );
         
-        println!("尝试获取低质量视频地址: {}", url);
+        debug_println!("尝试获取低质量视频地址: {}", url);
         
         let headers = self.build_headers(false);
         
@@ -498,7 +506,7 @@ impl BilibiliApi {
         if let Some(durl) = data.durl {
             if !durl.is_empty() {
                 let video_url = durl[0].url.clone();
-                println!("找到低质量视频URL: {}", video_url);
+                debug_println!("找到低质量视频URL: {}", video_url);
                 return Ok((video_url.clone(), video_url));
             }
         }

@@ -5,6 +5,14 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use crate::config::Language;
 
+// Windows平台特定导入
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
+// Windows平台下的CREATE_NO_WINDOW常量
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 pub struct DownloadQueuePage {
     download_manager: Arc<DownloadManager>,
     cover_cache: HashMap<String, egui::TextureHandle>,
@@ -244,9 +252,10 @@ impl DownloadQueuePage {
                                     if let Some(parent) = path.parent() {
                                         #[cfg(target_os = "windows")]
                                         {
-                                            let _ = std::process::Command::new("explorer")
-                                                .arg(parent)
-                                                .spawn();
+                                            let mut cmd = std::process::Command::new("explorer");
+                                            cmd.arg(parent);
+                                            cmd.creation_flags(CREATE_NO_WINDOW);
+                                            let _ = cmd.spawn();
                                         }
                                         #[cfg(target_os = "macos")]
                                         {

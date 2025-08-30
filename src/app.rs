@@ -7,6 +7,15 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use std::sync::mpsc;
 
+#[cfg(debug_assertions)]
+macro_rules! debug_println {
+    ($($arg:tt)*) => { println!($($arg)*) }
+}
+#[cfg(not(debug_assertions))]
+macro_rules! debug_println {
+    ($($arg:tt)*) => {}
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Page {
     Home,
@@ -119,38 +128,27 @@ impl BilibiliDownApp {
     }
     
     fn create_default_avatar_texture(cc: &eframe::CreationContext<'_>) -> egui::TextureHandle {
-        let size = 64;
-        let mut pixels = vec![0u8; size * size * 4];
+        let avatar_bytes = include_bytes!("../assets/OIP.webp");
         
-        for y in 0..size {
-            for x in 0..size {
-                let idx = (y * size + x) * 4;
-                let center = size as f32 / 2.0;
-                let dist = ((x as f32 - center).powi(2) + (y as f32 - center).powi(2)).sqrt();
-                
-                if dist < center - 2.0 {
-                    let t = (dist / center).min(1.0);
-                    let gray = (140.0 + 60.0 * (1.0 - t)) as u8;
-                    pixels[idx] = gray;
-                    pixels[idx + 1] = gray;
-                    pixels[idx + 2] = gray + 20;
-                    pixels[idx + 3] = 255;
-                } else if dist < center {
-                    let border_t = (dist - (center - 2.0)) / 2.0;
-                    let alpha = (255.0 * (1.0 - border_t)) as u8;
-                    pixels[idx] = 100;
-                    pixels[idx + 1] = 100;
-                    pixels[idx + 2] = 120;
-                    pixels[idx + 3] = alpha;
-                } else {
-                    pixels[idx + 3] = 0;
-                }
+        let image = image::load_from_memory(avatar_bytes).unwrap_or_else(|_| {
+            let size = 64;
+            let mut pixels = vec![128u8; size * size * 4];
+            for i in (0..pixels.len()).step_by(4) {
+                pixels[i + 3] = 255;
             }
-        }
+            image::DynamicImage::ImageRgba8(
+                image::RgbaImage::from_raw(size as u32, size as u32, pixels).unwrap()
+            )
+        });
+        
+        let resized = image.resize_exact(64, 64, image::imageops::FilterType::Lanczos3);
+        let rgba = resized.to_rgba8();
+        let size = [rgba.width() as usize, rgba.height() as usize];
+        let pixels = rgba.as_flat_samples();
         
         cc.egui_ctx.load_texture(
             "default_avatar",
-            egui::ColorImage::from_rgba_unmultiplied([size, size], &pixels),
+            egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_slice()),
             Default::default(),
         )
     }
