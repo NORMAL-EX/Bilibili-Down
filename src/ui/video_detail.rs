@@ -1,8 +1,10 @@
 use eframe::egui;
 use crate::bilibili::{BilibiliApi, VideoInfo, QualityInfo};
+use crate::config::{Config, Language};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 use std::sync::mpsc;
+use parking_lot::RwLock;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DownloadType {
@@ -17,17 +19,28 @@ pub struct VideoDetailWindow {
     runtime: Arc<Runtime>,
     cover_texture: Option<egui::TextureHandle>,
     cover_receiver: Option<mpsc::Receiver<Vec<u8>>>,
+    config: Arc<RwLock<Config>>,
 }
 
 impl VideoDetailWindow {
-    pub fn new(video_info: VideoInfo, api: Arc<BilibiliApi>, runtime: Arc<Runtime>) -> Self {
+    pub fn new(video_info: VideoInfo, api: Arc<BilibiliApi>, runtime: Arc<Runtime>, config: Arc<RwLock<Config>>) -> Self {
+        let available_qualities: Vec<usize> = video_info.qualities
+            .iter()
+            .enumerate()
+            .filter(|(_, q)| q.is_available)
+            .map(|(i, _)| i)
+            .collect();
+        
+        let selected_quality = available_qualities.first().copied().unwrap_or(0);
+        
         let mut window = Self {
             video_info: video_info.clone(),
-            selected_quality: 0,
+            selected_quality,
             api: api.clone(),
             runtime: runtime.clone(),
             cover_texture: None,
             cover_receiver: None,
+            config,
         };
         
         window.load_cover();
@@ -63,6 +76,32 @@ impl VideoDetailWindow {
         }
         
         egui::ColorImage::from_rgba_unmultiplied([width, height], &pixels)
+    }
+    
+    fn get_text(&self, key: &str) -> String {
+        let lang = self.config.read().language.clone();
+        match lang {
+            Language::SimplifiedChinese => {
+                match key {
+                    "up_owner" => "UP主".to_string(),
+                    "bv_id" => "BV号".to_string(),
+                    "video_description" => "视频简介".to_string(),
+                    "select_quality" => "选择画质".to_string(),
+                    "quality_unavailable" => "该画质不可用".to_string(),
+                    _ => key.to_string(),
+                }
+            }
+            Language::English => {
+                match key {
+                    "up_owner" => "UP".to_string(),
+                    "bv_id" => "BV ID".to_string(),
+                    "video_description" => "Video Description".to_string(),
+                    "select_quality" => "Select Quality".to_string(),
+                    "quality_unavailable" => "This quality is unavailable".to_string(),
+                    _ => key.to_string(),
+                }
+            }
+        }
     }
     
     pub fn show_with_texts(
@@ -121,13 +160,16 @@ impl VideoDetailWindow {
                     ui.label(egui::RichText::new(&self.video_info.title).size(18.0).strong());
                     ui.add_space(10.0);
                     
+                    let up_owner_text = self.get_text("up_owner");
+                    let bv_id_text = self.get_text("bv_id");
+                    
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("UP主:").strong());
+                        ui.label(egui::RichText::new(format!("{}:", up_owner_text)).strong());
                         ui.label(&self.video_info.owner.name);
                     });
                     
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("BV号:").strong());
+                        ui.label(egui::RichText::new(format!("{}:", bv_id_text)).strong());
                         ui.label(&self.video_info.bvid);
                     });
                 });
@@ -139,7 +181,8 @@ impl VideoDetailWindow {
             
             ui.group(|ui| {
                 ui.vertical(|ui| {
-                    ui.label(egui::RichText::new("视频简介:").strong());
+                    let video_desc_text = self.get_text("video_description");
+                    ui.label(egui::RichText::new(format!("{}:", video_desc_text)).strong());
                     ui.add_space(5.0);
                     egui::ScrollArea::vertical()
                         .max_height(100.0)
@@ -154,44 +197,87 @@ impl VideoDetailWindow {
             ui.add_space(10.0);
             
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("选择画质:").strong());
+                let select_quality_text = self.get_text("select_quality");
+                ui.label(egui::RichText::new(format!("{}:", select_quality_text)).strong());
+                
+                let current_quality = &self.video_info.qualities[self.selected_quality];
+                let display_text = if current_quality.is_available {
+                    current_quality.desc.clone()
+                } else {
+                    format!("{} ({})", current_quality.desc, self.get_text("quality_unavailable"))
+                };
+                
                 egui::ComboBox::from_id_salt("quality_select")
-                    .selected_text(&self.video_info.qualities[self.selected_quality].desc)
+                    .selected_text(&display_text)
                     .show_ui(ui, |ui| {
                         for (i, quality) in self.video_info.qualities.iter().enumerate() {
-                            ui.selectable_value(&mut self.selected_quality, i, &quality.desc);
+                            let is_selectable = quality.is_available;
+                            
+                            ui.add_enabled_ui(is_selectable, |ui| {
+                                let label_text = if is_selectable {
+                                    quality.desc.clone()
+                                } else {
+                                    quality.desc.clone()
+                                };
+                                
+                                let label = if is_selectable {
+                                    egui::RichText::new(label_text)
+                                } else {
+                                    egui::RichText::new(label_text).color(egui::Color32::from_rgb(128, 128, 128))
+                                };
+                                
+                                if ui.selectable_label(self.selected_quality == i, label).clicked() && is_selectable {
+                                    self.selected_quality = i;
+                                }
+                            });
                         }
                     });
             });
+            
+            if !self.video_info.qualities[self.selected_quality].is_available {
+                ui.colored_label(egui::Color32::from_rgb(255, 100, 100), self.get_text("quality_unavailable"));
+            }
             
             ui.add_space(20.0);
             ui.separator();
             ui.add_space(20.0);
             
             ui.horizontal(|ui| {
-                if ui.button(egui::RichText::new(download_video_text)
-                    .size(16.0)
-                    .color(egui::Color32::from_rgb(100, 200, 255)))
-                    .clicked() {
-                    result = Some((
-                        self.video_info.clone(),
-                        self.video_info.qualities[self.selected_quality].clone(),
-                        DownloadType::Video,
-                    ));
-                }
+                let is_quality_available = self.video_info.qualities[self.selected_quality].is_available;
                 
-                ui.add_space(10.0);
-                
-                if ui.button(egui::RichText::new(download_mp3_text)
-                    .size(16.0)
-                    .color(egui::Color32::from_rgb(100, 255, 150)))
-                    .clicked() {
-                    result = Some((
-                        self.video_info.clone(),
-                        self.video_info.qualities[self.selected_quality].clone(),
-                        DownloadType::Mp3,
-                    ));
-                }
+                ui.add_enabled_ui(is_quality_available, |ui| {
+                    if ui.button(egui::RichText::new(download_video_text)
+                        .size(16.0)
+                        .color(if is_quality_available { 
+                            egui::Color32::from_rgb(100, 200, 255) 
+                        } else { 
+                            egui::Color32::from_rgb(128, 128, 128) 
+                        }))
+                        .clicked() {
+                        result = Some((
+                            self.video_info.clone(),
+                            self.video_info.qualities[self.selected_quality].clone(),
+                            DownloadType::Video,
+                        ));
+                    }
+                    
+                    ui.add_space(10.0);
+                    
+                    if ui.button(egui::RichText::new(download_mp3_text)
+                        .size(16.0)
+                        .color(if is_quality_available { 
+                            egui::Color32::from_rgb(100, 255, 150) 
+                        } else { 
+                            egui::Color32::from_rgb(128, 128, 128) 
+                        }))
+                        .clicked() {
+                        result = Some((
+                            self.video_info.clone(),
+                            self.video_info.qualities[self.selected_quality].clone(),
+                            DownloadType::Mp3,
+                        ));
+                    }
+                });
                 
                 ui.add_space(10.0);
                 

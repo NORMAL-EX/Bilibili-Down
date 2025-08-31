@@ -5,7 +5,6 @@ use parking_lot::RwLock;
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT, REFERER, COOKIE};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// 在debug模式下使用正常的println!，在release模式下禁用
 #[cfg(debug_assertions)]
 macro_rules! debug_println {
     ($($arg:tt)*) => { println!($($arg)*) }
@@ -23,9 +22,6 @@ macro_rules! debug_eprintln {
 macro_rules! debug_eprintln {
     ($($arg:tt)*) => {}
 }
-
-// 其余代码保持不变，只是将所有的println!替换为debug_println!，eprintln!替换为debug_eprintln!
-// 代码太长，我只展示关键部分的修改
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VideoInfo {
@@ -49,6 +45,7 @@ pub struct Owner {
 pub struct QualityInfo {
     pub id: u32,
     pub desc: String,
+    pub is_available: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +53,7 @@ pub struct UserInfo {
     pub mid: u64,
     pub name: String,
     pub face: String,
+    pub is_vip: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -127,9 +125,7 @@ struct PlayUrlResponse {
 #[derive(Debug, Deserialize)]
 struct PlayUrlData {
     accept_quality: Vec<u32>,
-    #[allow(dead_code)]
     accept_description: Vec<String>,
-    #[allow(dead_code)]
     quality: u32,
     dash: Option<DashData>,
     durl: Option<Vec<DurlData>>,
@@ -197,6 +193,7 @@ struct NavData {
     face: Option<String>,
     uname: Option<String>,
     mid: Option<u64>,
+    vip_status: Option<u8>,
 }
 
 pub struct BilibiliApi {
@@ -204,6 +201,7 @@ pub struct BilibiliApi {
     cookies: Arc<RwLock<Option<String>>>,
     #[allow(dead_code)]
     runtime: Arc<Runtime>,
+    user_info: Arc<RwLock<Option<UserInfo>>>,
 }
 
 impl BilibiliApi {
@@ -217,6 +215,7 @@ impl BilibiliApi {
             client,
             cookies: Arc::new(RwLock::new(None)),
             runtime,
+            user_info: Arc::new(RwLock::new(None)),
         }
     }
     
@@ -239,10 +238,12 @@ impl BilibiliApi {
     
     pub async fn set_cookies(&self, cookies: &str) {
         *self.cookies.write() = Some(cookies.to_string());
+        let _ = self.get_user_info().await;
     }
     
     pub async fn clear_cookies(&self) {
         *self.cookies.write() = None;
+        *self.user_info.write() = None;
     }
     
     pub async fn get_user_info(&self) -> Result<UserInfo, String> {
@@ -269,11 +270,16 @@ impl BilibiliApi {
             return Err("用户未登录".to_string());
         }
         
-        Ok(UserInfo {
+        let user_info = UserInfo {
             mid: data.mid.unwrap_or(0),
             name: data.uname.unwrap_or_else(|| "未知用户".to_string()),
             face: data.face.unwrap_or_else(|| String::new()),
-        })
+            is_vip: data.vip_status.unwrap_or(0) == 1,
+        };
+        
+        *self.user_info.write() = Some(user_info.clone());
+        
+        Ok(user_info)
     }
     
     pub async fn download_avatar(&self, url: &str) -> Result<Vec<u8>, String> {
@@ -335,9 +341,10 @@ impl BilibiliApi {
     }
     
     async fn get_available_qualities(&self, bvid: &str, cid: u64) -> Result<Vec<QualityInfo>, String> {
+        let test_quality = 127;
         let url = format!(
-            "https://api.bilibili.com/x/player/playurl?bvid={}&cid={}&qn=80&fnval=4048&fourk=1",
-            bvid, cid
+            "https://api.bilibili.com/x/player/playurl?bvid={}&cid={}&qn={}&fnval=4048&fourk=1",
+            bvid, cid, test_quality
         );
         
         let headers = self.build_headers(true);
@@ -354,8 +361,8 @@ impl BilibiliApi {
         if response.code != 0 {
             if response.code == -400 || response.code == -404 {
                 return Ok(vec![
-                    QualityInfo { id: 32, desc: "480P 清晰".to_string() },
-                    QualityInfo { id: 16, desc: "360P 流畅".to_string() },
+                    QualityInfo { id: 32, desc: "480P 清晰".to_string(), is_available: true },
+                    QualityInfo { id: 16, desc: "360P 流畅".to_string(), is_available: true },
                 ]);
             }
             return Err(format!("获取分辨率失败: code={}", response.code));
@@ -363,47 +370,118 @@ impl BilibiliApi {
         
         let data = response.data.ok_or_else(|| "播放数据为空".to_string())?;
         
+        let current_quality = data.quality;
+        let accept_qualities = data.accept_quality.clone();
+        let accept_descriptions = data.accept_description.clone();
+        
+        let is_logged_in = self.cookies.read().is_some();
+        let is_vip = self.user_info.read().as_ref().map_or(false, |info| info.is_vip);
+        
         let mut qualities = Vec::new();
         let quality_map = [
-            (127, "8K 超高清"),
-            (120, "4K 超清"),
-            (116, "1080P 60帧"),
-            (112, "1080P+"),
-            (80, "1080P 高清"),
-            (64, "720P 高清"),
-            (32, "480P 清晰"),
-            (16, "360P 流畅"),
+            (127, "8K 超高清", true),
+            (120, "4K 超清", true), 
+            (116, "1080P 60帧", true),
+            (112, "1080P+", true),
+            (80, "1080P 高清", true),
+            (64, "720P 高清", false),
+            (32, "480P 清晰", false),
+            (16, "360P 流畅", false),
         ];
         
-        for &quality_id in &data.accept_quality {
-            if let Some(&(id, desc)) = quality_map.iter().find(|&&(id, _)| id == quality_id) {
-                qualities.push(QualityInfo {
-                    id,
-                    desc: desc.to_string(),
-                });
-            }
+        for (i, &quality_id) in accept_qualities.iter().enumerate() {
+            let desc = if i < accept_descriptions.len() {
+                accept_descriptions[i].clone()
+            } else {
+                quality_map.iter()
+                    .find(|&&(id, _, _)| id == quality_id)
+                    .map(|(_, desc, _)| desc.to_string())
+                    .unwrap_or_else(|| format!("质量 {}", quality_id))
+            };
+            
+            let needs_login = quality_map.iter()
+                .find(|&&(id, _, _)| id == quality_id)
+                .map(|(_, _, needs_login)| *needs_login)
+                .unwrap_or(true);
+            
+            let is_available = if !needs_login {
+                true
+            } else if !is_logged_in {
+                false
+            } else if quality_id == 112 || quality_id == 116 || quality_id == 120 || quality_id == 127 {
+                is_vip && quality_id <= current_quality
+            } else {
+                quality_id <= current_quality
+            };
+            
+            qualities.push(QualityInfo {
+                id: quality_id,
+                desc: if !is_available {
+                    if !is_logged_in && needs_login {
+                        format!("{} (需要登录)", desc)
+                    } else if !is_vip && (quality_id == 112 || quality_id == 116 || quality_id == 120 || quality_id == 127) {
+                        format!("{} (需要大会员)", desc)
+                    } else {
+                        format!("{} (不可用)", desc)
+                    }
+                } else {
+                    desc
+                },
+                is_available,
+            });
         }
         
         if qualities.is_empty() {
-            qualities.push(QualityInfo { id: 32, desc: "480P 清晰".to_string() });
-            qualities.push(QualityInfo { id: 16, desc: "360P 流畅".to_string() });
+            qualities.push(QualityInfo { id: 32, desc: "480P 清晰".to_string(), is_available: true });
+            qualities.push(QualityInfo { id: 16, desc: "360P 流畅".to_string(), is_available: true });
         }
         
         Ok(qualities)
     }
     
-    #[allow(dead_code)]
-    fn decode_cdn_url(&self, url: &str) -> String {
-        url.to_string()
+    pub async fn get_actual_quality(&self, bvid: &str, cid: u64, requested_quality: u32) -> Result<u32, String> {
+        let url = format!(
+            "https://api.bilibili.com/x/player/playurl?bvid={}&cid={}&qn={}&fnval=4048&fourk=1",
+            bvid, cid, requested_quality
+        );
+        
+        debug_println!("检查实际可获取的画质: {}", requested_quality);
+        
+        let headers = self.build_headers(true);
+        
+        let response = self.client.get(&url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| format!("请求失败: {}", e))?;
+        
+        let response_text = response.text().await.map_err(|e| format!("读取响应失败: {}", e))?;
+        
+        let response: PlayUrlResponse = serde_json::from_str(&response_text)
+            .map_err(|e| format!("解析JSON失败: {}", e))?;
+        
+        if response.code != 0 {
+            return Err(format!("获取画质失败: code={}", response.code));
+        }
+        
+        let data = response.data.ok_or_else(|| "播放数据为空".to_string())?;
+        
+        let actual_quality = data.quality;
+        
+        debug_println!("请求画质: {}, 实际获得画质: {}", requested_quality, actual_quality);
+        
+        Ok(actual_quality)
     }
     
     pub async fn get_download_urls(&self, bvid: &str, cid: u64, quality: u32) -> Result<(String, String), String> {
+        let actual_quality = self.get_actual_quality(bvid, cid, quality).await?;
+        
         let url = format!(
             "https://api.bilibili.com/x/player/playurl?bvid={}&cid={}&qn={}&fnval=4048&fourk=1",
-            bvid, cid, quality
+            bvid, cid, actual_quality
         );
         
-        debug_println!("请求播放地址: {}", url);
+        debug_println!("请求播放地址，使用实际画质: {}", actual_quality);
         
         let headers = self.build_headers(true);
         
@@ -434,7 +512,7 @@ impl BilibiliApi {
         if let Some(dash) = data.dash {
             if !dash.video.is_empty() && !dash.audio.is_empty() {
                 let video = dash.video.iter()
-                    .find(|v| v.id == quality)
+                    .find(|v| v.id == actual_quality)
                     .or_else(|| dash.video.first())
                     .ok_or_else(|| "没有可用的视频流".to_string())?;
                 

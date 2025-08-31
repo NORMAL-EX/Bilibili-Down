@@ -359,7 +359,8 @@ impl eframe::App for BilibiliDownApp {
                         self.video_detail_window = Some(VideoDetailWindow::new(
                             video_info,
                             self.bilibili_api.clone(),
-                            self.runtime.clone()
+                            self.runtime.clone(),
+                            self.config.clone()
                         ));
                         self.show_video_detail = true;
                         self.error_message = None;

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use crate::config::Language;
+use std::sync::mpsc;
 
 // Windows平台特定导入
 #[cfg(target_os = "windows")]
@@ -17,18 +18,56 @@ pub struct DownloadQueuePage {
     download_manager: Arc<DownloadManager>,
     cover_cache: HashMap<String, egui::TextureHandle>,
     cover_loading: HashMap<String, bool>,
+    cover_receiver: Option<mpsc::Receiver<(String, Vec<u8>)>>,
+    cover_sender: mpsc::Sender<(String, Vec<u8>)>,
 }
 
 impl DownloadQueuePage {
     pub fn new(download_manager: Arc<DownloadManager>) -> Self {
+        let (tx, rx) = mpsc::channel();
         Self { 
             download_manager,
             cover_cache: HashMap::new(),
             cover_loading: HashMap::new(),
+            cover_receiver: Some(rx),
+            cover_sender: tx,
         }
     }
     
     pub fn show_with_texts(&mut self, ui: &mut egui::Ui, pause_text: &str, resume_text: &str, delete_text: &str) {
+        // 处理接收到的封面图片
+        if let Some(receiver) = &self.cover_receiver {
+            while let Ok((task_id, cover_bytes)) = receiver.try_recv() {
+                if let Ok(image) = image::load_from_memory(&cover_bytes) {
+                    let rgba = image.resize(120, 67, image::imageops::FilterType::Lanczos3).to_rgba8();
+                    let size = [rgba.width() as usize, rgba.height() as usize];
+                    let pixels = rgba.as_flat_samples();
+                    let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                        size,
+                        pixels.as_slice(),
+                    );
+                    let texture = ui.ctx().load_texture(
+                        format!("cover_{}", task_id),
+                        color_image,
+                        Default::default(),
+                    );
+                    self.cover_cache.insert(task_id.clone(), texture);
+                    self.cover_loading.remove(&task_id);
+                } else {
+                    // 如果图片加载失败，使用占位图
+                    let placeholder = Self::create_placeholder_thumbnail();
+                    let texture = ui.ctx().load_texture(
+                        format!("cover_placeholder_{}", task_id),
+                        placeholder,
+                        Default::default(),
+                    );
+                    self.cover_cache.insert(task_id.clone(), texture);
+                    self.cover_loading.remove(&task_id);
+                }
+                ui.ctx().request_repaint();
+            }
+        }
+        
         let tasks = self.download_manager.get_tasks();
         
         if tasks.is_empty() {
@@ -73,7 +112,12 @@ impl DownloadQueuePage {
             match action.as_str() {
                 "pause" => self.download_manager.pause_task(&task_id),
                 "resume" => self.download_manager.resume_task(&task_id),
-                "delete" => self.download_manager.cancel_task(&task_id),
+                "delete" => {
+                    self.download_manager.cancel_task(&task_id);
+                    // 清理缓存
+                    self.cover_cache.remove(&task_id);
+                    self.cover_loading.remove(&task_id);
+                },
                 _ => {}
             }
         }
@@ -104,30 +148,28 @@ impl DownloadQueuePage {
             };
             
             // 显示封面
-            if !self.cover_cache.contains_key(&task_id) && !self.cover_loading.contains_key(&task_id) {
+            if let Some(texture) = self.cover_cache.get(&task_id) {
+                // 已缓存的封面
+                ui.add(egui::Image::new(texture)
+                    .max_size(egui::Vec2::new(120.0, 67.0))
+                    .rounding(3.0));
+            } else if self.cover_loading.contains_key(&task_id) {
+                // 正在加载，显示占位图
+                let placeholder = Self::create_placeholder_thumbnail();
+                let texture = ui.ctx().load_texture(
+                    format!("cover_loading_{}", task_id),
+                    placeholder,
+                    Default::default(),
+                );
+                ui.add(egui::Image::new(&texture)
+                    .max_size(egui::Vec2::new(120.0, 67.0))
+                    .rounding(3.0));
+            } else {
                 // 开始加载封面
                 self.cover_loading.insert(task_id.clone(), true);
-                let ctx = ui.ctx().clone();
-                let _task_id_clone = task_id.clone();
-                
-                // 异步加载封面
-                std::thread::spawn(move || {
-                    if let Ok(response) = reqwest::blocking::get(&cover_url) {
-                        if let Ok(bytes) = response.bytes() {
-                            if let Ok(image) = image::load_from_memory(&bytes) {
-                                let rgba = image.resize(120, 67, image::imageops::FilterType::Lanczos3).to_rgba8();
-                                let size = [rgba.width() as usize, rgba.height() as usize];
-                                let pixels = rgba.as_flat_samples();
-                                let _color_image = egui::ColorImage::from_rgba_unmultiplied(
-                                    size,
-                                    pixels.as_slice(),
-                                );
-                                
-                                ctx.request_repaint();
-                            }
-                        }
-                    }
-                });
+                let sender = self.cover_sender.clone();
+                let task_id_clone = task_id.clone();
+                let cover_url_clone = cover_url.clone();
                 
                 // 显示占位图
                 let placeholder = Self::create_placeholder_thumbnail();
@@ -139,21 +181,15 @@ impl DownloadQueuePage {
                 ui.add(egui::Image::new(&texture)
                     .max_size(egui::Vec2::new(120.0, 67.0))
                     .rounding(3.0));
-            } else if let Some(texture) = self.cover_cache.get(&task_id) {
-                ui.add(egui::Image::new(texture)
-                    .max_size(egui::Vec2::new(120.0, 67.0))
-                    .rounding(3.0));
-            } else {
-                // 正在加载，显示占位图
-                let placeholder = Self::create_placeholder_thumbnail();
-                let texture = ui.ctx().load_texture(
-                    format!("cover_loading_{}", task_id),
-                    placeholder,
-                    Default::default(),
-                );
-                ui.add(egui::Image::new(&texture)
-                    .max_size(egui::Vec2::new(120.0, 67.0))
-                    .rounding(3.0));
+                
+                // 异步加载封面
+                std::thread::spawn(move || {
+                    if let Ok(response) = reqwest::blocking::get(&cover_url_clone) {
+                        if let Ok(bytes) = response.bytes() {
+                            let _ = sender.send((task_id_clone, bytes.to_vec()));
+                        }
+                    }
+                });
             }
             
             ui.vertical(|ui| {
