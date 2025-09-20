@@ -1,3 +1,4 @@
+// src/bilibili.rs
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
@@ -208,6 +209,7 @@ impl BilibiliApi {
     pub fn new(runtime: Arc<Runtime>) -> Self {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap();
         
@@ -300,7 +302,7 @@ impl BilibiliApi {
     }
     
     pub async fn get_video_info(&self, input: &str) -> Result<VideoInfo, String> {
-        let bvid = self.extract_bvid(input);
+        let bvid = self.extract_bvid(input).await?;
         
         let url = format!("https://api.bilibili.com/x/web-interface/view?bvid={}", bvid);
         
@@ -384,7 +386,7 @@ impl BilibiliApi {
             (116, "1080P 60帧", true),
             (112, "1080P+", true),
             (80, "1080P 高清", true),
-            (64, "720P 高清", false),
+            (64, "720P 高清", true),
             (32, "480P 清晰", false),
             (16, "360P 流畅", false),
         ];
@@ -592,42 +594,172 @@ impl BilibiliApi {
         Err("无法获取任何可用的下载地址".to_string())
     }
     
-    pub fn extract_bvid(&self, input: &str) -> String {
+    async fn resolve_short_url(&self, short_url: &str) -> Result<String, String> {
+        debug_println!("解析短链接: {}", short_url);
+        
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0")
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| format!("创建HTTP客户端失败: {}", e))?;
+        
+        let mut current_url = short_url.to_string();
+        let mut max_redirects = 10;
+        
+        while max_redirects > 0 {
+            let response = client
+                .get(&current_url)
+                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+                .send()
+                .await
+                .map_err(|e| format!("请求失败: {}", e))?;
+            
+            let status = response.status();
+            debug_println!("状态码: {}, URL: {}", status, current_url);
+            
+            if status.is_redirection() {
+                if let Some(location) = response.headers().get("location") {
+                    let location_str = location.to_str()
+                        .map_err(|e| format!("解析Location header失败: {}", e))?;
+                    
+                    current_url = if location_str.starts_with("http") {
+                        location_str.to_string()
+                    } else if location_str.starts_with("//") {
+                        format!("https:{}", location_str)
+                    } else {
+                        format!("https://b23.tv{}", location_str)
+                    };
+                    
+                    debug_println!("重定向到: {}", current_url);
+                    
+                    if current_url.contains("bilibili.com/video/") {
+                        debug_println!("找到完整链接: {}", current_url);
+                        return Ok(current_url);
+                    }
+                } else {
+                    return Err("重定向响应缺少Location header".to_string());
+                }
+            } else if status.is_success() {
+                debug_println!("最终URL: {}", current_url);
+                return Ok(current_url);
+            } else {
+                return Err(format!("请求失败，状态码: {}", status));
+            }
+            
+            max_redirects -= 1;
+        }
+        
+        Err("重定向次数过多".to_string())
+    }
+    
+    fn extract_url_from_text(&self, text: &str) -> Option<String> {
+        // 查找http或https开头的URL
+        if let Some(http_start) = text.find("http") {
+            let url_part = &text[http_start..];
+            // 找到URL的结束位置（空格、换行或字符串结尾）
+            let end_pos = url_part.find(|c: char| c.is_whitespace() || c == '】' || c == '"' || c == '\'' || c == '>' || c == '<')
+                .unwrap_or(url_part.len());
+            let url = &url_part[..end_pos];
+            return Some(url.to_string());
+        }
+        
+        // 如果没有找到http开头的，尝试查找b23.tv
+        if let Some(b23_pos) = text.find("b23.tv") {
+            // 向前查找可能的协议部分
+            let start = if b23_pos >= 8 && &text[b23_pos - 8..b23_pos] == "https://" {
+                b23_pos - 8
+            } else if b23_pos >= 7 && &text[b23_pos - 7..b23_pos] == "http://" {
+                b23_pos - 7
+            } else {
+                // 如果没有协议，添加https://
+                return self.extract_url_from_text(&format!("https://{}", &text[b23_pos..]));
+            };
+            
+            let url_part = &text[start..];
+            let end_pos = url_part.find(|c: char| c.is_whitespace() || c == '】' || c == '"' || c == '\'' || c == '>' || c == '<')
+                .unwrap_or(url_part.len());
+            let url = &url_part[..end_pos];
+            return Some(url.to_string());
+        }
+        
+        None
+    }
+    
+    pub async fn extract_bvid(&self, input: &str) -> Result<String, String> {
         let input = input.trim();
         
-        if input.starts_with("BV") || input.starts_with("bv") {
-            let bvid = input.chars()
+        // 处理包含标题和链接的情况
+        // 首先尝试从文本中提取URL
+        let actual_input = if input.contains("b23.tv") || input.contains("bilibili.com") {
+            // 尝试提取URL部分
+            if let Some(extracted_url) = self.extract_url_from_text(input) {
+                debug_println!("从输入中提取的URL: {}", extracted_url);
+                extracted_url
+            } else {
+                input.to_string()
+            }
+        } else {
+            input.to_string()
+        };
+        
+        // 处理b23.tv短链接
+        if actual_input.contains("b23.tv") {
+            debug_println!("检测到b23.tv短链接，开始解析...");
+            let resolved_url = self.resolve_short_url(&actual_input).await?;
+            debug_println!("解析后的URL: {}", resolved_url);
+            
+            // 从解析后的URL中提取BV号
+            if let Some(bvid) = self.extract_bvid_from_url(&resolved_url) {
+                return Ok(bvid);
+            }
+            
+            return Err("无法从解析后的URL中提取BV号".to_string());
+        }
+        
+        // 直接是BV号
+        if actual_input.starts_with("BV") || actual_input.starts_with("bv") {
+            let bvid = actual_input.chars()
                 .take_while(|c| c.is_alphanumeric())
                 .collect::<String>();
             if bvid.len() >= 10 {
-                return if bvid.starts_with("bv") {
+                return Ok(if bvid.starts_with("bv") {
                     format!("BV{}", &bvid[2..])
                 } else {
                     bvid
-                };
+                });
             }
         }
         
-        if input.contains("bilibili.com") || input.contains("b23.tv") {
-            let patterns = ["BV", "bv"];
-            for pattern in &patterns {
-                if let Some(idx) = input.find(pattern) {
-                    let bvid_start = &input[idx..];
-                    let bvid: String = bvid_start.chars()
-                        .take_while(|c| c.is_alphanumeric())
-                        .collect();
-                    if bvid.len() >= 10 {
-                        return if bvid.starts_with("bv") {
-                            format!("BV{}", &bvid[2..])
-                        } else {
-                            bvid
-                        };
-                    }
+        // 从bilibili.com链接中提取
+        if actual_input.contains("bilibili.com") {
+            if let Some(bvid) = self.extract_bvid_from_url(&actual_input) {
+                return Ok(bvid);
+            }
+        }
+        
+        Ok(actual_input)
+    }
+    
+    fn extract_bvid_from_url(&self, url: &str) -> Option<String> {
+        let patterns = ["BV", "bv"];
+        for pattern in &patterns {
+            if let Some(idx) = url.find(pattern) {
+                let bvid_start = &url[idx..];
+                let bvid: String = bvid_start.chars()
+                    .take_while(|c| c.is_alphanumeric())
+                    .collect();
+                if bvid.len() >= 10 {
+                    return Some(if bvid.starts_with("bv") {
+                        format!("BV{}", &bvid[2..])
+                    } else {
+                        bvid
+                    });
                 }
             }
         }
-        
-        input.to_string()
+        None
     }
     
     pub async fn generate_qrcode(&self) -> Result<(String, String), String> {

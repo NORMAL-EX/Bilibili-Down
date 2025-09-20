@@ -1,9 +1,9 @@
-// src/ui/home.rs
+// src\ui\home.rs
 use eframe::egui;
 use crate::config::Language;
 
 pub struct HomePage {
-    input: String,
+    pub input: String,  // 改为pub，允许外部访问
 }
 
 impl HomePage {

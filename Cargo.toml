@@ -1,7 +1,11 @@
 [package]
 name = "bilibili-down"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
+
+[package.metadata.winresource]
+OriginalFilename = "bilibili-down.exe"
+LegalCopyright = "Copyright © NORMAL-EX 2025-present"
 
 [dependencies]
 eframe = "0.29"
@@ -28,6 +32,11 @@ env_logger = "0.11"
 uuid = { version = "1.11", features = ["v4"] }
 aria2-ws = "0.2"
 winreg = "0.52"
+clipboard = "0.5"
+lazy_static = "1.4"
+win-toast-notify = "0.1.6"
+urlencoding = "2.1"
+ico = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = [
@@ -36,5 +45,18 @@ winapi = { version = "0.3", features = [
     "handleapi",
     "winnt",
     "minwindef",
-    "winbase"
+    "winbase",
+    "shellapi",
+    "shobjidl_core"
 ]}
+windows = { version = "0.52", features = [
+    "Foundation",
+    "Data_Xml_Dom",
+    "UI_Notifications"
+]}
+
+[target.'cfg(not(windows))'.dependencies]
+notify-rust = "4.11"
+
+[build-dependencies]
+winresource = "0.1"

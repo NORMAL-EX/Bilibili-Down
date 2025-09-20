@@ -1,3 +1,4 @@
+// src\app.rs
 use crate::config::{Config, Theme, Language};
 use crate::downloader::{DownloadManager, DownloadTask};
 use crate::bilibili::{BilibiliApi, VideoInfo, QualityInfo};
@@ -6,6 +7,19 @@ use eframe::egui;
 use std::sync::Arc;
 use parking_lot::RwLock;
 use std::sync::mpsc;
+use clipboard::{ClipboardProvider, ClipboardContext};
+
+#[cfg(target_os = "windows")]
+use winreg::enums::*;
+#[cfg(target_os = "windows")]
+use winreg::RegKey;
+#[cfg(target_os = "windows")]
+use windows::{
+    core::{HSTRING, IInspectable, ComInterface},
+    Data::Xml::Dom::XmlDocument,
+    UI::Notifications::{ToastNotification, ToastNotificationManager, ToastActivatedEventArgs},
+    Foundation::TypedEventHandler,
+};
 
 #[cfg(debug_assertions)]
 macro_rules! debug_println {
@@ -13,6 +27,15 @@ macro_rules! debug_println {
 }
 #[cfg(not(debug_assertions))]
 macro_rules! debug_println {
+    ($($arg:tt)*) => {}
+}
+
+#[cfg(debug_assertions)]
+macro_rules! debug_eprintln {
+    ($($arg:tt)*) => { eprintln!($($arg)*) }
+}
+#[cfg(not(debug_assertions))]
+macro_rules! debug_eprintln {
     ($($arg:tt)*) => {}
 }
 
@@ -53,6 +76,17 @@ pub struct BilibiliDownApp {
     show_avatar_menu: bool,
     avatar_menu_id: egui::Id,
     avatar_button_rect: Option<egui::Rect>,
+    
+    clipboard: ClipboardContext,
+    last_clipboard_content: String,
+    notification_shown_for: Vec<String>,
+    startup_clipboard_content: String,
+    app_started_time: std::time::Instant,
+    
+    pending_parse_url: Option<String>,
+    show_parse_dialog: bool,
+    parse_dialog_url: Option<String>,
+    notification_handler: Option<mpsc::Receiver<String>>,
 }
 
 impl BilibiliDownApp {
@@ -74,6 +108,12 @@ impl BilibiliDownApp {
         ));
         
         let default_avatar = Self::create_default_avatar_texture(cc);
+        
+        let mut clipboard: ClipboardContext = ClipboardProvider::new().unwrap();
+        
+        let startup_clipboard = clipboard.get_contents().unwrap_or_default();
+        
+        let (tx, rx) = mpsc::channel();
         
         let mut app = Self {
             config: config.clone(),
@@ -99,10 +139,37 @@ impl BilibiliDownApp {
             show_avatar_menu: false,
             avatar_menu_id: egui::Id::new("avatar_context_menu"),
             avatar_button_rect: None,
+            clipboard,
+            last_clipboard_content: startup_clipboard.clone(),
+            notification_shown_for: Vec::new(),
+            startup_clipboard_content: startup_clipboard,
+            app_started_time: std::time::Instant::now(),
+            pending_parse_url: None,
+            show_parse_dialog: false,
+            parse_dialog_url: None,
+            notification_handler: Some(rx),
         };
+        
+        Self::set_notification_sender(tx);
         
         app.check_login_status(&cc.egui_ctx);
         app
+    }
+    
+    fn set_notification_sender(sender: mpsc::Sender<String>) {
+        use std::sync::Mutex;
+        lazy_static::lazy_static! {
+            static ref NOTIFICATION_SENDER: Mutex<Option<mpsc::Sender<String>>> = Mutex::new(None);
+        }
+        *NOTIFICATION_SENDER.lock().unwrap() = Some(sender);
+    }
+    
+    fn get_notification_sender() -> Option<mpsc::Sender<String>> {
+        use std::sync::Mutex;
+        lazy_static::lazy_static! {
+            static ref NOTIFICATION_SENDER: Mutex<Option<mpsc::Sender<String>>> = Mutex::new(None);
+        }
+        NOTIFICATION_SENDER.lock().unwrap().clone()
     }
     
     fn setup_fonts(ctx: &egui::Context) {
@@ -175,9 +242,6 @@ impl BilibiliDownApp {
     fn is_system_dark_mode() -> bool {
         #[cfg(target_os = "windows")]
         {
-            use winreg::enums::*;
-            use winreg::RegKey;
-            
             let hkcu = RegKey::predef(HKEY_CURRENT_USER);
             if let Ok(key) = hkcu.open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize") {
                 if let Ok(value) = key.get_value::<u32, _>("AppsUseLightTheme") {
@@ -214,22 +278,6 @@ impl BilibiliDownApp {
         }
     }
     
-    #[allow(dead_code)]
-    fn load_user_info(&mut self, _ctx: &egui::Context) {
-        let api = self.bilibili_api.clone();
-        let runtime = self.runtime.clone();
-        let (tx, rx) = mpsc::channel();
-        self.avatar_receiver = Some(rx);
-        
-        runtime.spawn(async move {
-            if let Ok(user_info) = api.get_user_info().await {
-                if let Ok(avatar_bytes) = api.download_avatar(&user_info.face).await {
-                    let _ = tx.send((avatar_bytes, user_info.name));
-                }
-            }
-        });
-    }
-    
     fn get_text(&self, key: &str) -> String {
         match self.config.read().language {
             Language::SimplifiedChinese => {
@@ -243,10 +291,10 @@ impl BilibiliDownApp {
                     "not_logged_in" => "未登录".to_string(),
                     "logged_in_user" => "已登录用户".to_string(),
                     "parse_video" => "B站视频解析".to_string(),
-                    "input_hint" => "请输入视频BV号或视频链接".to_string(),
+                    "input_hint" => "请输入视频BV号、视频链接或短链接".to_string(),
                     "parse" => "解析".to_string(),
-                    "download_video" => "解析下载视频".to_string(),
-                    "download_mp3" => "解析下载MP3".to_string(),
+                    "download_video" => "下载视频".to_string(),
+                    "download_mp3" => "下载MP3".to_string(),
                     "cancel" => "取消".to_string(),
                     "pause" => "暂停".to_string(),
                     "resume" => "继续".to_string(),
@@ -257,6 +305,10 @@ impl BilibiliDownApp {
                     "parsing_video" => "正在解析视频信息...".to_string(),
                     "error" => "错误".to_string(),
                     "need_login" => "需要登录才能下载高质量视频".to_string(),
+                    "parse_notification_title" => "检测到B站视频链接".to_string(),
+                    "parse_notification_body" => "是否解析该视频？".to_string(),
+                    "parse_confirm_title" => "视频解析确认".to_string(),
+                    "parse_confirm_body" => "检测到B站链接，是否开始解析？".to_string(),
                     _ => key.to_string(),
                 }
             }
@@ -271,7 +323,7 @@ impl BilibiliDownApp {
                     "not_logged_in" => "Not Logged In".to_string(),
                     "logged_in_user" => "Logged In User".to_string(),
                     "parse_video" => "Bilibili Video Parser".to_string(),
-                    "input_hint" => "Enter video BV number or video link".to_string(),
+                    "input_hint" => "Enter BV ID, video link or short link".to_string(),
                     "parse" => "Parse".to_string(),
                     "download_video" => "Download Video".to_string(),
                     "download_mp3" => "Download MP3".to_string(),
@@ -285,6 +337,10 @@ impl BilibiliDownApp {
                     "parsing_video" => "Parsing video information...".to_string(),
                     "error" => "Error".to_string(),
                     "need_login" => "Login required for high quality video".to_string(),
+                    "parse_notification_title" => "Bilibili link detected".to_string(),
+                    "parse_notification_body" => "Parse this video?".to_string(),
+                    "parse_confirm_title" => "Video Parse Confirmation".to_string(),
+                    "parse_confirm_body" => "Bilibili link detected, start parsing?".to_string(),
                     _ => key.to_string(),
                 }
             }
@@ -347,15 +403,255 @@ impl BilibiliDownApp {
         self.handle_logout(&egui::Context::default());
         self.show_login_window = true;
     }
+    
+    fn check_clipboard(&mut self, ctx: &egui::Context) {
+        if self.app_started_time.elapsed() < std::time::Duration::from_secs(3) {
+            return;
+        }
+        
+        if let Ok(contents) = self.clipboard.get_contents() {
+            if contents == self.startup_clipboard_content {
+                return;
+            }
+            
+            if contents != self.last_clipboard_content {
+                self.last_clipboard_content = contents.clone();
+                
+                if (contents.contains("bilibili.com/video/") || 
+                    contents.contains("b23.tv/") || 
+                    (contents.starts_with("BV") && contents.len() >= 10)) &&
+                   !self.notification_shown_for.contains(&contents) {
+                    
+                    self.notification_shown_for.push(contents.clone());
+                    
+                    if self.notification_shown_for.len() > 10 {
+                        self.notification_shown_for.remove(0);
+                    }
+                    // TODO:fix notification bug
+                    // self.show_interactive_notification(contents.clone());
+                    
+                    ctx.request_repaint();
+                }
+            }
+        }
+    }
+    
+    fn show_interactive_notification(&self, url: String) {
+        #[cfg(target_os = "windows")]
+        {
+            use windows::core::Result;
+            
+            let title = self.get_text("parse_notification_title");
+            let body = self.get_text("parse_notification_body");
+            
+            let result: Result<()> = (|| {
+                let toast_xml = XmlDocument::new()?;
+                
+                // 使用简单的launch参数传递URL，避免复杂的XML转义问题
+                let xml_content = format!(
+                    r#"<toast activationType="foreground" launch="parseurl:{url}">
+                        <visual>
+                            <binding template="ToastGeneric">
+                                <text>{title}</text>
+                                <text>{body}</text>
+                            </binding>
+                        </visual>
+                        <actions>
+                            <action content="解析视频" arguments="parseurl:{url}" activationType="foreground"/>
+                            <action content="忽略" arguments="dismiss" activationType="foreground"/>
+                        </actions>
+                        <audio src="ms-winsoundevent:Notification.Default" />
+                    </toast>"#,
+                    url = url.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;"),
+                    title = title,
+                    body = body
+                );
+                
+                debug_println!("Toast XML: {}", xml_content);
+                toast_xml.LoadXml(&HSTRING::from(&xml_content))?;
+                
+                let toast = ToastNotification::CreateToastNotification(&toast_xml)?;
+                
+                // 处理Toast激活事件
+                let sender = Self::get_notification_sender();
+                let url_clone = url.clone();
+                toast.Activated(&TypedEventHandler::new(move |_toast, result: &Option<IInspectable>| {
+                    debug_println!("Toast activated event triggered!");
+                    
+                    // 尝试获取参数
+                    let mut should_send = false;
+                    let mut parsed_url = url_clone.clone();
+                    
+                    if let Some(inspectable) = result {
+                        // 尝试转换为ToastActivatedEventArgs
+                        if let Ok(args) = inspectable.cast::<ToastActivatedEventArgs>() {
+                            if let Ok(args_str) = args.Arguments() {
+                                let args_string = args_str.to_string_lossy();
+                                debug_println!("Toast arguments: {}", args_string);
+                                
+                                // 检查参数
+                                if args_string.starts_with("parseurl:") {
+                                    parsed_url = args_string[9..].to_string();
+                                    should_send = true;
+                                    debug_println!("Extracted URL: {}", parsed_url);
+                                } else if args_string == "dismiss" {
+                                    debug_println!("User dismissed notification");
+                                    should_send = false;
+                                } else if !args_string.is_empty() {
+                                    // 其他参数也尝试发送
+                                    should_send = true;
+                                }
+                            }
+                        } else {
+                            // 无法转换，但仍然发送URL
+                            debug_println!("Could not cast to ToastActivatedEventArgs, sending URL anyway");
+                            should_send = true;
+                        }
+                    } else {
+                        // 点击了通知主体
+                        debug_println!("Toast body clicked, sending URL");
+                        should_send = true;
+                    }
+                    
+                    // 发送URL到主线程
+                    if should_send {
+                        if let Some(ref sender) = sender {
+                            debug_println!("Sending URL to main thread: {}", parsed_url);
+                            if let Err(e) = sender.send(parsed_url) {
+                                debug_eprintln!("Failed to send URL: {:?}", e);
+                            }
+                        } else {
+                            debug_eprintln!("No sender available!");
+                        }
+                    }
+                    
+                    Ok(())
+                }))?;
+                
+                // 使用PowerShell的AUMID进行测试，或者使用自定义的app_id
+                // 首先尝试使用我们注册的app id
+                let app_id = "BilibiliDown.App";
+                let notifier_result = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(app_id));
+                
+                let notifier = match notifier_result {
+                    Ok(n) => {
+                        debug_println!("Using app id: {}", app_id);
+                        n
+                    }
+                    Err(_) => {
+                        // 如果失败，使用PowerShell的AUMID
+                        let powershell_id = "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe";
+                        debug_println!("Falling back to PowerShell AUMID: {}", powershell_id);
+                        ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(powershell_id))?
+                    }
+                };
+                
+                notifier.Show(&toast)?;
+                debug_println!("Toast notification shown successfully");
+                
+                Ok(())
+            })();
+            
+            if let Err(e) = result {
+                debug_eprintln!("显示通知失败: {:?}", e);
+            }
+        }
+        
+        #[cfg(not(target_os = "windows"))]
+        {
+            use notify_rust::Notification;
+            let _ = Notification::new()
+                .appname("Bilibili-Down")
+                .summary(&self.get_text("parse_notification_title"))
+                .body(&self.get_text("parse_notification_body"))
+                .icon("bilibili")
+                .timeout(5000)
+                .show();
+        }
+    }
 }
 
 impl eframe::App for BilibiliDownApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.check_clipboard(ctx);
+        
+        // 处理通知点击事件
+        if let Some(ref receiver) = self.notification_handler {
+            while let Ok(url) = receiver.try_recv() {
+                debug_println!("收到通知点击事件，URL: {}", url);
+                
+                // 清理URL，移除parseurl:前缀
+                let clean_url = if url.starts_with("parseurl:") {
+                    url[9..].to_string()
+                } else {
+                    url
+                };
+                
+                debug_println!("清理后的URL: {}", clean_url);
+                self.parse_dialog_url = Some(clean_url);
+                self.show_parse_dialog = true;
+                ctx.request_repaint();
+            }
+        }
+        
+        // 显示解析确认对话框
+        if self.show_parse_dialog {
+            if let Some(url) = &self.parse_dialog_url.clone() {
+                let url_clone = url.clone();
+                let mut close_dialog = false;
+                let mut should_parse = false;
+                
+                egui::Window::new(self.get_text("parse_confirm_title"))
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.label(self.get_text("parse_confirm_body"));
+                            ui.add_space(10.0);
+                            
+                            let display_url = if url_clone.len() > 50 {
+                                format!("{}...", &url_clone[..50])
+                            } else {
+                                url_clone.clone()
+                            };
+                            ui.label(format!("链接: {}", display_url));
+                            ui.add_space(20.0);
+                            
+                            ui.horizontal(|ui| {
+                                if ui.button(egui::RichText::new(self.get_text("parse")).size(16.0)).clicked() {
+                                    should_parse = true;
+                                    close_dialog = true;
+                                }
+                                
+                                if ui.button(egui::RichText::new(self.get_text("cancel")).size(16.0)).clicked() {
+                                    close_dialog = true;
+                                }
+                            });
+                        });
+                    });
+                
+                if close_dialog {
+                    self.show_parse_dialog = false;
+                    let url_to_parse = self.parse_dialog_url.take();
+                    
+                    if should_parse {
+                        if let Some(url) = url_to_parse {
+                            debug_println!("开始解析视频: {}", url);
+                            self.parse_video(url);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 处理视频解析结果
         if let Some(receiver) = &self.video_info_receiver {
             if let Ok(result) = receiver.try_recv() {
                 self.loading = false;
                 match result {
                     Ok(video_info) => {
+                        debug_println!("视频解析成功: {}", video_info.title);
                         self.video_detail_window = Some(VideoDetailWindow::new(
                             video_info,
                             self.bilibili_api.clone(),
@@ -366,6 +662,7 @@ impl eframe::App for BilibiliDownApp {
                         self.error_message = None;
                     }
                     Err(err) => {
+                        debug_eprintln!("视频解析失败: {}", err);
                         self.error_message = Some(err);
                     }
                 }
@@ -373,6 +670,7 @@ impl eframe::App for BilibiliDownApp {
             }
         }
         
+        // 处理用户头像加载
         if let Some(receiver) = &self.avatar_receiver {
             if let Ok((avatar_bytes, username)) = receiver.try_recv() {
                 if let Ok(image) = image::load_from_memory(&avatar_bytes) {
@@ -395,6 +693,7 @@ impl eframe::App for BilibiliDownApp {
             }
         }
         
+        // 顶部导航栏
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let home_text = self.get_text("home");
@@ -433,6 +732,7 @@ impl eframe::App for BilibiliDownApp {
             });
         });
         
+        // 用户菜单
         if self.show_avatar_menu && self.is_logged_in {
             if let Some(button_rect) = self.avatar_button_rect {
                 let menu_pos = button_rect.left_bottom() + egui::Vec2::new(0.0, 5.0);
@@ -480,6 +780,7 @@ impl eframe::App for BilibiliDownApp {
             }
         }
         
+        // 主面板
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(error) = &self.error_message {
                 ui.colored_label(egui::Color32::RED, format!("{}: {}", self.get_text("error"), error));
@@ -531,6 +832,7 @@ impl eframe::App for BilibiliDownApp {
             }
         });
         
+        // 登录窗口
         if self.show_login_window {
             let login_title = self.get_text("login");
             let mut login_result = None;
@@ -564,6 +866,7 @@ impl eframe::App for BilibiliDownApp {
             }
         }
         
+        // 视频详情窗口
         if self.show_video_detail {
             let download_video_text = self.get_text("download_video");
             let download_mp3_text = self.get_text("download_mp3");
@@ -595,12 +898,13 @@ impl eframe::App for BilibiliDownApp {
                 
                 if !self.show_video_detail || close_window {
                     self.video_detail_window = None;
+                    self.show_video_detail = false;
                 }
             } else {
                 self.show_video_detail = false;
             }
         }
         
-        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        ctx.request_repaint_after(std::time::Duration::from_millis(500));
     }
 }
