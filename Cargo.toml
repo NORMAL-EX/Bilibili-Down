@@ -5,7 +5,7 @@ edition = "2021"
 
 [package.metadata.winresource]
 OriginalFilename = "bilibili-down.exe"
-LegalCopyright = "Copyright © NORMAL-EX 2025-present"
+LegalCopyright = "Copyright Â© NORMAL-EX 2025-present"
 
 [dependencies]
 eframe = "0.29"
@@ -37,6 +37,7 @@ lazy_static = "1.4"
 win-toast-notify = "0.1.6"
 urlencoding = "2.1"
 ico = "0.3"
+winit = "0.29"  # 添加winit依赖来获取窗口句柄
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = [
@@ -47,7 +48,9 @@ winapi = { version = "0.3", features = [
     "minwindef",
     "winbase",
     "shellapi",
-    "shobjidl_core"
+    "shobjidl_core",
+    "dwmapi",  # 添加dwmapi特性
+    "winuser"  # 添加winuser特性用于获取窗口句柄
 ]}
 windows = { version = "0.52", features = [
     "Foundation",

@@ -21,6 +21,17 @@ use windows::{
     Foundation::TypedEventHandler,
 };
 
+// Windows DWM相关导入
+#[cfg(target_os = "windows")]
+use winapi::{
+    um::dwmapi::DwmSetWindowAttribute,
+    shared::windef::HWND,
+};
+
+// DWM窗口属性常量
+#[cfg(target_os = "windows")]
+const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+
 #[cfg(debug_assertions)]
 macro_rules! debug_println {
     ($($arg:tt)*) => { println!($($arg)*) }
@@ -87,6 +98,9 @@ pub struct BilibiliDownApp {
     show_parse_dialog: bool,
     parse_dialog_url: Option<String>,
     notification_handler: Option<mpsc::Receiver<String>>,
+    
+    #[cfg(target_os = "windows")]
+    window_hwnd: Option<HWND>,
 }
 
 impl BilibiliDownApp {
@@ -95,7 +109,16 @@ impl BilibiliDownApp {
         let config = Arc::new(RwLock::new(Config::load()));
         
         Self::setup_fonts(&cc.egui_ctx);
-        Self::apply_theme(&cc.egui_ctx, &config.read().theme);
+        
+        // 获取窗口句柄
+        #[cfg(target_os = "windows")]
+        let window_hwnd = Self::get_window_hwnd_from_cc(cc);
+        
+        // 应用主题
+        #[cfg(target_os = "windows")]
+        Self::apply_theme_with_hwnd(&cc.egui_ctx, &config.read().theme, window_hwnd);
+        #[cfg(not(target_os = "windows"))]
+        Self::apply_theme_static(&cc.egui_ctx, &config.read().theme);
         
         let bilibili_api = Arc::new(BilibiliApi::new(runtime.clone()));
         
@@ -148,12 +171,32 @@ impl BilibiliDownApp {
             show_parse_dialog: false,
             parse_dialog_url: None,
             notification_handler: Some(rx),
+            #[cfg(target_os = "windows")]
+            window_hwnd,
         };
         
         Self::set_notification_sender(tx);
         
         app.check_login_status(&cc.egui_ctx);
         app
+    }
+    
+    // 从CreationContext获取窗口句柄
+    #[cfg(target_os = "windows")]
+    fn get_window_hwnd_from_cc(cc: &eframe::CreationContext<'_>) -> Option<HWND> {
+        // 尝试通过winit获取窗口句柄
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        
+        if let Ok(window_handle) = cc.window_handle() {
+            if let RawWindowHandle::Win32(handle) = window_handle.as_raw() {
+                let hwnd = handle.hwnd.get() as HWND;
+                debug_println!("成功获取窗口句柄: {:?}", hwnd);
+                return Some(hwnd);
+            }
+        }
+        
+        debug_eprintln!("无法从CreationContext获取窗口句柄");
+        None
     }
     
     fn set_notification_sender(sender: mpsc::Sender<String>) {
@@ -220,23 +263,83 @@ impl BilibiliDownApp {
         )
     }
     
-    fn apply_theme(ctx: &egui::Context, theme: &Theme) {
+    // 设置DWM标题栏颜色
+    #[cfg(target_os = "windows")]
+    fn set_dwm_titlebar_color(hwnd: HWND, use_dark_mode: bool) {
+        unsafe {
+            let value = if use_dark_mode { 1i32 } else { 0i32 };
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                &value as *const _ as *const _,
+                std::mem::size_of::<i32>() as u32,
+            );
+            debug_println!("设置DWM标题栏颜色: 深色模式={}", use_dark_mode);
+        }
+    }
+    
+    // Windows版本：静态方法应用主题
+    #[cfg(target_os = "windows")]
+    fn apply_theme_with_hwnd(ctx: &egui::Context, theme: &Theme, hwnd: Option<HWND>) {
+        let (visuals, use_dark_mode) = match theme {
+            Theme::System => {
+                let is_dark = Self::is_system_dark_mode();
+                (
+                    if is_dark { egui::Visuals::dark() } else { egui::Visuals::light() },
+                    is_dark
+                )
+            }
+            Theme::Light => (egui::Visuals::light(), false),
+            Theme::Dark => (egui::Visuals::dark(), true),
+        };
+        
+        ctx.set_visuals(visuals);
+        
+        // 设置DWM标题栏颜色
+        if let Some(hwnd) = hwnd {
+            Self::set_dwm_titlebar_color(hwnd, use_dark_mode);
+        }
+    }
+    
+    // 非Windows版本：静态方法应用主题
+    #[cfg(not(target_os = "windows"))]
+    fn apply_theme_static(ctx: &egui::Context, theme: &Theme) {
         let visuals = match theme {
             Theme::System => {
-                if cfg!(target_os = "windows") {
-                    if Self::is_system_dark_mode() {
-                        egui::Visuals::dark()
-                    } else {
-                        egui::Visuals::light()
-                    }
-                } else {
-                    egui::Visuals::dark()
+                if Self::is_system_dark_mode() { 
+                    egui::Visuals::dark() 
+                } else { 
+                    egui::Visuals::light() 
                 }
             }
             Theme::Light => egui::Visuals::light(),
             Theme::Dark => egui::Visuals::dark(),
         };
+        
         ctx.set_visuals(visuals);
+    }
+    
+    // 实例方法：运行时应用主题
+    fn apply_theme(&mut self, ctx: &egui::Context, theme: &Theme) {
+        let (visuals, use_dark_mode) = match theme {
+            Theme::System => {
+                let is_dark = Self::is_system_dark_mode();
+                (
+                    if is_dark { egui::Visuals::dark() } else { egui::Visuals::light() },
+                    is_dark
+                )
+            }
+            Theme::Light => (egui::Visuals::light(), false),
+            Theme::Dark => (egui::Visuals::dark(), true),
+        };
+        
+        ctx.set_visuals(visuals);
+        
+        // 设置DWM标题栏颜色
+        #[cfg(target_os = "windows")]
+        if let Some(hwnd) = self.window_hwnd {
+            Self::set_dwm_titlebar_color(hwnd, use_dark_mode);
+        }
     }
     
     fn is_system_dark_mode() -> bool {
@@ -824,8 +927,11 @@ impl eframe::App for BilibiliDownApp {
                     }
                     Page::Settings => {
                         let settings_text = self.get_text("settings");
+                        // 修复：在设置改变后重新获取主题
                         if self.settings_page.show_with_text(ui, &settings_text) {
-                            Self::apply_theme(ctx, &self.config.read().theme);
+                            // 重新读取新的主题值
+                            let new_theme = self.config.read().theme.clone();
+                            self.apply_theme(ctx, &new_theme);
                         }
                     }
                 }
