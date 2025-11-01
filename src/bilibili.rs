@@ -15,10 +15,12 @@ macro_rules! debug_println {
     ($($arg:tt)*) => {}
 }
 
+#[allow(unused_macros)]
 #[cfg(debug_assertions)]
 macro_rules! debug_eprintln {
     ($($arg:tt)*) => { eprintln!($($arg)*) }
 }
+#[allow(unused_macros)]
 #[cfg(not(debug_assertions))]
 macro_rules! debug_eprintln {
     ($($arg:tt)*) => {}

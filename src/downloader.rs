@@ -237,8 +237,8 @@ impl DownloadManager {
                 self.aria2_process = Some(child);
                 std::thread::sleep(std::time::Duration::from_secs(2));
             }
-            Err(e) => {
-                debug_eprintln!("无法启动 aria2c: {}", e);
+            Err(_e) => {
+                debug_eprintln!("无法启动 aria2c: {}", _e);
             }
         }
     }
@@ -258,9 +258,9 @@ impl DownloadManager {
                         *aria2_client.write() = Some(client);
                         break;
                     }
-                    Err(e) => {
+                    Err(_e) => {
                         retry_count += 1;
-                        debug_eprintln!("连接aria2失败 (尝试 {}/{}): {}", retry_count, max_retries, e);
+                        debug_eprintln!("连接aria2失败 (尝试 {}/{}): {}", retry_count, max_retries, _e);
                         if retry_count >= max_retries {
                             debug_eprintln!("无法连接到 aria2 RPC");
                             break;
@@ -661,8 +661,8 @@ impl DownloadManager {
                     false
                 }
             }
-            Err(e) => {
-                debug_eprintln!("运行ffmpeg失败: {}", e);
+            Err(_e) => {
+                debug_eprintln!("运行ffmpeg失败: {}", _e);
                 false
             }
         }

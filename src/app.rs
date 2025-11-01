@@ -93,8 +93,7 @@ pub struct BilibiliDownApp {
     notification_shown_for: Vec<String>,
     startup_clipboard_content: String,
     app_started_time: std::time::Instant,
-    
-    pending_parse_url: Option<String>,
+
     show_parse_dialog: bool,
     parse_dialog_url: Option<String>,
     notification_handler: Option<mpsc::Receiver<String>>,
@@ -167,7 +166,6 @@ impl BilibiliDownApp {
             notification_shown_for: Vec::new(),
             startup_clipboard_content: startup_clipboard,
             app_started_time: std::time::Instant::now(),
-            pending_parse_url: None,
             show_parse_dialog: false,
             parse_dialog_url: None,
             notification_handler: Some(rx),
@@ -207,6 +205,7 @@ impl BilibiliDownApp {
         *NOTIFICATION_SENDER.lock().unwrap() = Some(sender);
     }
     
+    #[allow(dead_code)]
     fn get_notification_sender() -> Option<mpsc::Sender<String>> {
         use std::sync::Mutex;
         lazy_static::lazy_static! {
@@ -218,23 +217,101 @@ impl BilibiliDownApp {
     fn setup_fonts(ctx: &egui::Context) {
         let mut fonts = egui::FontDefinitions::default();
         
-        let font_data = include_bytes!("../assets/NotoSansSC.ttf");
-        fonts.font_data.insert(
-            "chinese_font".to_owned(),
-            egui::FontData::from_static(font_data),
-        );
+        // 尝试加载Windows系统微软雅黑字体
+        let font_loaded = Self::load_microsoft_yahei_font(&mut fonts);
         
-        fonts.families
-            .entry(egui::FontFamily::Proportional)
-            .or_default()
-            .insert(0, "chinese_font".to_owned());
-        
-        fonts.families
-            .entry(egui::FontFamily::Monospace)
-            .or_default()
-            .push("chinese_font".to_owned());
+        if font_loaded {
+            // 设置微软雅黑为主要字体
+            fonts.families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .insert(0, "microsoft_yahei".to_owned());
+            
+            fonts.families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .insert(0, "microsoft_yahei".to_owned());
+        }
         
         ctx.set_fonts(fonts);
+    }
+    
+    fn load_microsoft_yahei_font(fonts: &mut egui::FontDefinitions) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            // 获取Windows字体目录
+            let font_paths = Self::get_windows_font_paths();
+            
+            // 尝试加载微软雅黑字体文件
+            for font_path in font_paths {
+                if let Ok(font_data) = std::fs::read(&font_path) {
+                    // 成功读取字体文件
+                    fonts.font_data.insert(
+                        "microsoft_yahei".to_owned(),
+                        egui::FontData::from_owned(font_data)
+                    );
+                    return true;
+                }
+            }
+            
+            // 如果所有路径都失败，返回false
+            false
+        }
+        
+        #[cfg(not(target_os = "windows"))]
+        {
+            // 非Windows系统，不加载微软雅黑
+            false
+        }
+    }
+    
+    #[cfg(target_os = "windows")]
+    fn get_windows_font_paths() -> Vec<std::path::PathBuf> {
+        use std::path::PathBuf;
+        
+        let mut paths = Vec::new();
+        
+        // 方法1: 从环境变量获取Windows目录
+        if let Ok(windir) = std::env::var("WINDIR") {
+            paths.push(PathBuf::from(&windir).join("Fonts").join("msyh.ttc"));
+            paths.push(PathBuf::from(&windir).join("Fonts").join("msyh.ttf"));
+        }
+        
+        // 方法2: 从SystemRoot环境变量获取
+        if let Ok(systemroot) = std::env::var("SystemRoot") {
+            paths.push(PathBuf::from(&systemroot).join("Fonts").join("msyh.ttc"));
+            paths.push(PathBuf::from(&systemroot).join("Fonts").join("msyh.ttf"));
+        }
+        
+        // 方法3: 使用默认路径（适用于大多数Windows系统）
+        paths.push(PathBuf::from("C:\\Windows\\Fonts\\msyh.ttc"));
+        paths.push(PathBuf::from("C:\\Windows\\Fonts\\msyh.ttf"));
+        
+        // 方法4: 使用注册表获取字体目录
+        if let Some(font_path) = Self::get_font_from_registry() {
+            paths.push(font_path);
+        }
+        
+        paths
+    }
+    
+    #[cfg(target_os = "windows")]
+    fn get_font_from_registry() -> Option<std::path::PathBuf> {
+        use std::path::PathBuf;
+        
+        let hkcu = RegKey::predef(HKEY_LOCAL_MACHINE);
+        if let Ok(key) = hkcu.open_subkey("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts") {
+            if let Ok(value) = key.get_value::<String, _>("微软雅黑 & Microsoft YaHei UI (TrueType)") {
+                // 如果是相对路径，需要加上Windows\Fonts目录
+                if !value.contains(':') && !value.starts_with('\\') {
+                    if let Ok(windir) = std::env::var("WINDIR") {
+                        return Some(PathBuf::from(windir).join("Fonts").join(value));
+                    }
+                }
+                return Some(PathBuf::from(value));
+            }
+        }
+        None
     }
     
     fn create_default_avatar_texture(cc: &eframe::CreationContext<'_>) -> egui::TextureHandle {
@@ -539,6 +616,7 @@ impl BilibiliDownApp {
         }
     }
     
+    #[allow(dead_code)]
     fn show_interactive_notification(&self, url: String) {
         #[cfg(target_os = "windows")]
         {
@@ -620,8 +698,8 @@ impl BilibiliDownApp {
                     if should_send {
                         if let Some(ref sender) = sender {
                             debug_println!("Sending URL to main thread: {}", parsed_url);
-                            if let Err(e) = sender.send(parsed_url) {
-                                debug_eprintln!("Failed to send URL: {:?}", e);
+                            if let Err(_e) = sender.send(parsed_url) {
+                                debug_eprintln!("Failed to send URL: {:?}", _e);
                             }
                         } else {
                             debug_eprintln!("No sender available!");
@@ -655,8 +733,8 @@ impl BilibiliDownApp {
                 Ok(())
             })();
             
-            if let Err(e) = result {
-                debug_eprintln!("显示通知失败: {:?}", e);
+            if let Err(_e) = result {
+                debug_eprintln!("显示通知失败: {:?}", _e);
             }
         }
         
