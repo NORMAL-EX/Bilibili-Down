@@ -8,9 +8,14 @@ A modern Bilibili video downloader built with Rust and egui GUI framework.
 ![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)
 ![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)
 
+## 👉 Official Website
+
+https://bilibili-down.github.io
+
 ## 🌟 Features
 
 - 🎥 **High-Quality Video Downloads** - Support up to 8K ultra-high definition
+- ❌ **High-quality video download without login** - Breaking through Bilibili's wbi authentication enables login-free video downloads up to 1080P resolution.
 - 🎵 **Audio Extraction** - Download MP3 format audio
 - 🔐 **Login Support** - QR code login for premium video access
 - ⚡ **Multi-threaded Downloads** - High-speed downloads powered by aria2c
@@ -98,8 +103,8 @@ bilibili-down/
 | 4K | Super HD | ✅ |
 | 1080P 60fps | High Frame Rate | ✅ |
 | 1080P+ | High Bitrate | ✅ |
-| 1080P | Full HD | ✅ |
-| 720P | HD | ✅ |
+| 1080P | Full HD | ❌ |
+| 720P | HD | ❌ |
 | 480P | SD | ❌ |
 | 360P | Low | ❌ |
 
@@ -188,6 +193,8 @@ This project is licensed under the [MIT License](./LICENSE).
 - [egui](https://github.com/emilk/egui) - Excellent GUI framework
 - [aria2](https://aria2.github.io/) - Powerful download tool
 - [FFmpeg](https://ffmpeg.org/) - Professional audio/video processing
+- [dddffgg](https://github.com/NORMAL-EX) - Software development and support for 1080P resolution video parsing without login
+- [hwyyds-skidder-team](https://github.com/hwyyds-skidder-team) - Support for 720P resolution video parsing without login
 - All contributors and users for their support
 
 ## 📞 Support
@@ -200,6 +207,4 @@ If you like this project, please give it a ⭐!
 
 ---
 
-*Last updated: August 30, 2025*
-
-*My last work before the end of summer vacation*
+*Last updated: December 7, 2025*

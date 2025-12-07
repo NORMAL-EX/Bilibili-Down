@@ -545,7 +545,7 @@ impl BilibiliDownApp {
     }
     
     fn start_download(&mut self, video_info: VideoInfo, quality: QualityInfo, download_type: crate::ui::video_detail::DownloadType) {
-        if !self.is_logged_in && quality.id > 32 {
+        if !self.is_logged_in && quality.id > 80 {
             self.error_message = Some(self.get_text("need_login"));
             self.show_login_window = true;
             return;
