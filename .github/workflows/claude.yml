@@ -2,12 +2,16 @@ name: Claude Code
 on:
   issue_comment:
     types: [created]
+  issues:
+    types: [opened]
   pull_request_review_comment:
     types: [created]
 
 jobs:
   claude:
-    if: contains(github.event.comment.body, '@claude')
+    if: |
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'issues' && contains(github.event.issue.body, '@claude'))
     runs-on: ubuntu-latest
     permissions:
       contents: write
