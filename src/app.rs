@@ -1,4 +1,4 @@
-// src\app.rs
+// src/app.rs
 use crate::config::{Config, Theme, Language};
 use crate::downloader::{DownloadManager, DownloadTask};
 use crate::bilibili::{BilibiliApi, VideoInfo, QualityInfo};
@@ -7,7 +7,7 @@ use eframe::egui;
 use std::sync::Arc;
 use parking_lot::RwLock;
 use std::sync::mpsc;
-use clipboard::{ClipboardProvider, ClipboardContext};
+use arboard::Clipboard;
 
 #[cfg(target_os = "windows")]
 use winreg::enums::*;
@@ -88,7 +88,7 @@ pub struct BilibiliDownApp {
     avatar_menu_id: egui::Id,
     avatar_button_rect: Option<egui::Rect>,
     
-    clipboard: ClipboardContext,
+    clipboard: Option<Clipboard>,
     last_clipboard_content: String,
     notification_shown_for: Vec<String>,
     startup_clipboard_content: String,
@@ -131,9 +131,11 @@ impl BilibiliDownApp {
         
         let default_avatar = Self::create_default_avatar_texture(cc);
         
-        let mut clipboard: ClipboardContext = ClipboardProvider::new().unwrap();
+        let mut clipboard = Clipboard::new().ok();
         
-        let startup_clipboard = clipboard.get_contents().unwrap_or_default();
+        let startup_clipboard = clipboard.as_mut()
+            .and_then(|cb| cb.get_text().ok())
+            .unwrap_or_default();
         
         let (tx, rx) = mpsc::channel();
         
@@ -217,79 +219,115 @@ impl BilibiliDownApp {
     fn setup_fonts(ctx: &egui::Context) {
         let mut fonts = egui::FontDefinitions::default();
         
-        // 尝试加载Windows系统微软雅黑字体
-        let font_loaded = Self::load_microsoft_yahei_font(&mut fonts);
+        // 尝试加载系统中文字体
+        let font_loaded = Self::load_cjk_font(&mut fonts);
         
         if font_loaded {
-            // 设置微软雅黑为主要字体
             fonts.families
                 .entry(egui::FontFamily::Proportional)
                 .or_default()
-                .insert(0, "microsoft_yahei".to_owned());
+                .insert(0, "cjk_font".to_owned());
             
             fonts.families
                 .entry(egui::FontFamily::Monospace)
                 .or_default()
-                .insert(0, "microsoft_yahei".to_owned());
+                .insert(0, "cjk_font".to_owned());
         }
         
         ctx.set_fonts(fonts);
     }
     
-    fn load_microsoft_yahei_font(fonts: &mut egui::FontDefinitions) -> bool {
+    fn load_cjk_font(fonts: &mut egui::FontDefinitions) -> bool {
+        let font_paths = Self::get_system_cjk_font_paths();
+        
+        for font_path in font_paths {
+            if let Ok(font_data) = std::fs::read(&font_path) {
+                fonts.font_data.insert(
+                    "cjk_font".to_owned(),
+                    egui::FontData::from_owned(font_data)
+                );
+                debug_println!("已加载中文字体: {:?}", font_path);
+                return true;
+            }
+        }
+        
+        false
+    }
+    
+    fn get_system_cjk_font_paths() -> Vec<std::path::PathBuf> {
+        use std::path::PathBuf;
+        let mut paths = Vec::new();
+        
         #[cfg(target_os = "windows")]
         {
-            // 获取Windows字体目录
-            let font_paths = Self::get_windows_font_paths();
+            // Windows: 微软雅黑
+            if let Ok(windir) = std::env::var("WINDIR") {
+                paths.push(PathBuf::from(&windir).join("Fonts").join("msyh.ttc"));
+                paths.push(PathBuf::from(&windir).join("Fonts").join("msyh.ttf"));
+            }
+            if let Ok(systemroot) = std::env::var("SystemRoot") {
+                paths.push(PathBuf::from(&systemroot).join("Fonts").join("msyh.ttc"));
+                paths.push(PathBuf::from(&systemroot).join("Fonts").join("msyh.ttf"));
+            }
+            paths.push(PathBuf::from("C:\\Windows\\Fonts\\msyh.ttc"));
+            paths.push(PathBuf::from("C:\\Windows\\Fonts\\msyh.ttf"));
             
-            // 尝试加载微软雅黑字体文件
-            for font_path in font_paths {
-                if let Ok(font_data) = std::fs::read(&font_path) {
-                    // 成功读取字体文件
-                    fonts.font_data.insert(
-                        "microsoft_yahei".to_owned(),
-                        egui::FontData::from_owned(font_data)
-                    );
-                    return true;
+            // 也尝试从注册表获取
+            if let Some(font_path) = Self::get_font_from_registry() {
+                paths.push(font_path);
+            }
+        }
+        
+        #[cfg(target_os = "macos")]
+        {
+            // macOS: PingFang SC / Hiragino Sans
+            paths.push(PathBuf::from("/System/Library/Fonts/PingFang.ttc"));
+            paths.push(PathBuf::from("/System/Library/Fonts/STHeiti Light.ttc"));
+            paths.push(PathBuf::from("/System/Library/Fonts/STHeiti Medium.ttc"));
+            paths.push(PathBuf::from("/Library/Fonts/Arial Unicode.ttf"));
+        }
+        
+        #[cfg(target_os = "linux")]
+        {
+            // Linux: Noto Sans CJK / WenQuanYi
+            let font_dirs = [
+                "/usr/share/fonts",
+                "/usr/local/share/fonts",
+            ];
+            
+            let font_names = [
+                "NotoSansCJK-Regular.ttc",
+                "NotoSansSC-Regular.otf",
+                "NotoSansSC-Regular.ttf",
+                "wqy-microhei.ttc",
+                "wqy-zenhei.ttc",
+                "DroidSansFallback.ttf",
+            ];
+            
+            for dir in &font_dirs {
+                for name in &font_names {
+                    // 直接路径
+                    paths.push(PathBuf::from(dir).join(name));
+                    // 搜索子目录
+                    let noto_path = PathBuf::from(dir).join("noto-cjk").join(name);
+                    paths.push(noto_path);
+                    let noto_path2 = PathBuf::from(dir).join("noto").join(name);
+                    paths.push(noto_path2);
+                    let truetype_path = PathBuf::from(dir).join("truetype").join("noto").join(name);
+                    paths.push(truetype_path);
+                    let wqy_path = PathBuf::from(dir).join("wenquanyi").join(name);
+                    paths.push(wqy_path);
+                    let truetype_wqy = PathBuf::from(dir).join("truetype").join("wqy").join(name);
+                    paths.push(truetype_wqy);
                 }
             }
             
-            // 如果所有路径都失败，返回false
-            false
-        }
-        
-        #[cfg(not(target_os = "windows"))]
-        {
-            // 非Windows系统，不加载微软雅黑
-            false
-        }
-    }
-    
-    #[cfg(target_os = "windows")]
-    fn get_windows_font_paths() -> Vec<std::path::PathBuf> {
-        use std::path::PathBuf;
-        
-        let mut paths = Vec::new();
-        
-        // 方法1: 从环境变量获取Windows目录
-        if let Ok(windir) = std::env::var("WINDIR") {
-            paths.push(PathBuf::from(&windir).join("Fonts").join("msyh.ttc"));
-            paths.push(PathBuf::from(&windir).join("Fonts").join("msyh.ttf"));
-        }
-        
-        // 方法2: 从SystemRoot环境变量获取
-        if let Ok(systemroot) = std::env::var("SystemRoot") {
-            paths.push(PathBuf::from(&systemroot).join("Fonts").join("msyh.ttc"));
-            paths.push(PathBuf::from(&systemroot).join("Fonts").join("msyh.ttf"));
-        }
-        
-        // 方法3: 使用默认路径（适用于大多数Windows系统）
-        paths.push(PathBuf::from("C:\\Windows\\Fonts\\msyh.ttc"));
-        paths.push(PathBuf::from("C:\\Windows\\Fonts\\msyh.ttf"));
-        
-        // 方法4: 使用注册表获取字体目录
-        if let Some(font_path) = Self::get_font_from_registry() {
-            paths.push(font_path);
+            // 用户字体目录
+            if let Some(home) = dirs::home_dir() {
+                for name in &font_names {
+                    paths.push(home.join(".local/share/fonts").join(name));
+                }
+            }
         }
         
         paths
@@ -302,7 +340,6 @@ impl BilibiliDownApp {
         let hkcu = RegKey::predef(HKEY_LOCAL_MACHINE);
         if let Ok(key) = hkcu.open_subkey("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts") {
             if let Ok(value) = key.get_value::<String, _>("微软雅黑 & Microsoft YaHei UI (TrueType)") {
-                // 如果是相对路径，需要加上Windows\Fonts目录
                 if !value.contains(':') && !value.starts_with('\\') {
                     if let Ok(windir) = std::env::var("WINDIR") {
                         return Some(PathBuf::from(windir).join("Fonts").join(value));
@@ -372,7 +409,6 @@ impl BilibiliDownApp {
         
         ctx.set_visuals(visuals);
         
-        // 设置DWM标题栏颜色
         if let Some(hwnd) = hwnd {
             Self::set_dwm_titlebar_color(hwnd, use_dark_mode);
         }
@@ -398,7 +434,7 @@ impl BilibiliDownApp {
     
     // 实例方法：运行时应用主题
     fn apply_theme(&mut self, ctx: &egui::Context, theme: &Theme) {
-        let (visuals, use_dark_mode) = match theme {
+        let (visuals, _use_dark_mode) = match theme {
             Theme::System => {
                 let is_dark = Self::is_system_dark_mode();
                 (
@@ -415,7 +451,7 @@ impl BilibiliDownApp {
         // 设置DWM标题栏颜色
         #[cfg(target_os = "windows")]
         if let Some(hwnd) = self.window_hwnd {
-            Self::set_dwm_titlebar_color(hwnd, use_dark_mode);
+            Self::set_dwm_titlebar_color(hwnd, _use_dark_mode);
         }
     }
     
@@ -429,6 +465,45 @@ impl BilibiliDownApp {
                 }
             }
         }
+        
+        #[cfg(target_os = "macos")]
+        {
+            // macOS: 检查 defaults read
+            if let Ok(output) = std::process::Command::new("defaults")
+                .args(["read", "-globalDomain", "AppleInterfaceStyle"])
+                .output()
+            {
+                if output.status.success() {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    return stdout.trim().eq_ignore_ascii_case("dark");
+                }
+            }
+        }
+        
+        #[cfg(target_os = "linux")]
+        {
+            // Linux GNOME/GTK: 检查 gsettings
+            if let Ok(output) = std::process::Command::new("gsettings")
+                .args(["get", "org.gnome.desktop.interface", "color-scheme"])
+                .output()
+            {
+                if output.status.success() {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    return stdout.contains("dark");
+                }
+            }
+            // KDE Plasma
+            if let Ok(output) = std::process::Command::new("gsettings")
+                .args(["get", "org.gnome.desktop.interface", "gtk-theme"])
+                .output()
+            {
+                if output.status.success() {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    return stdout.to_lowercase().contains("dark");
+                }
+            }
+        }
+        
         false
     }
     
@@ -589,29 +664,31 @@ impl BilibiliDownApp {
             return;
         }
         
-        if let Ok(contents) = self.clipboard.get_contents() {
-            if contents == self.startup_clipboard_content {
-                return;
-            }
+        let contents = self.clipboard.as_mut()
+            .and_then(|cb| cb.get_text().ok())
+            .unwrap_or_default();
+        
+        if contents == self.startup_clipboard_content {
+            return;
+        }
+        
+        if contents != self.last_clipboard_content {
+            self.last_clipboard_content = contents.clone();
             
-            if contents != self.last_clipboard_content {
-                self.last_clipboard_content = contents.clone();
+            if (contents.contains("bilibili.com/video/") || 
+                contents.contains("b23.tv/") || 
+                (contents.starts_with("BV") && contents.len() >= 10)) &&
+               !self.notification_shown_for.contains(&contents) {
                 
-                if (contents.contains("bilibili.com/video/") || 
-                    contents.contains("b23.tv/") || 
-                    (contents.starts_with("BV") && contents.len() >= 10)) &&
-                   !self.notification_shown_for.contains(&contents) {
-                    
-                    self.notification_shown_for.push(contents.clone());
-                    
-                    if self.notification_shown_for.len() > 10 {
-                        self.notification_shown_for.remove(0);
-                    }
-                    // TODO:fix notification bug
-                    // self.show_interactive_notification(contents.clone());
-                    
-                    ctx.request_repaint();
+                self.notification_shown_for.push(contents.clone());
+                
+                if self.notification_shown_for.len() > 10 {
+                    self.notification_shown_for.remove(0);
                 }
+                // TODO:fix notification bug
+                // self.show_interactive_notification(contents.clone());
+                
+                ctx.request_repaint();
             }
         }
     }
@@ -628,7 +705,6 @@ impl BilibiliDownApp {
             let result: Result<()> = (|| {
                 let toast_xml = XmlDocument::new()?;
                 
-                // 使用简单的launch参数传递URL，避免复杂的XML转义问题
                 let xml_content = format!(
                     r#"<toast activationType="foreground" launch="parseurl:{url}">
                         <visual>
@@ -653,24 +729,20 @@ impl BilibiliDownApp {
                 
                 let toast = ToastNotification::CreateToastNotification(&toast_xml)?;
                 
-                // 处理Toast激活事件
                 let sender = Self::get_notification_sender();
                 let url_clone = url.clone();
                 toast.Activated(&TypedEventHandler::new(move |_toast, result: &Option<IInspectable>| {
                     debug_println!("Toast activated event triggered!");
                     
-                    // 尝试获取参数
                     let mut should_send = false;
                     let mut parsed_url = url_clone.clone();
                     
                     if let Some(inspectable) = result {
-                        // 尝试转换为ToastActivatedEventArgs
                         if let Ok(args) = inspectable.cast::<ToastActivatedEventArgs>() {
                             if let Ok(args_str) = args.Arguments() {
                                 let args_string = args_str.to_string_lossy();
                                 debug_println!("Toast arguments: {}", args_string);
                                 
-                                // 检查参数
                                 if args_string.starts_with("parseurl:") {
                                     parsed_url = args_string[9..].to_string();
                                     should_send = true;
@@ -679,22 +751,18 @@ impl BilibiliDownApp {
                                     debug_println!("User dismissed notification");
                                     should_send = false;
                                 } else if !args_string.is_empty() {
-                                    // 其他参数也尝试发送
                                     should_send = true;
                                 }
                             }
                         } else {
-                            // 无法转换，但仍然发送URL
                             debug_println!("Could not cast to ToastActivatedEventArgs, sending URL anyway");
                             should_send = true;
                         }
                     } else {
-                        // 点击了通知主体
                         debug_println!("Toast body clicked, sending URL");
                         should_send = true;
                     }
                     
-                    // 发送URL到主线程
                     if should_send {
                         if let Some(ref sender) = sender {
                             debug_println!("Sending URL to main thread: {}", parsed_url);
@@ -709,8 +777,6 @@ impl BilibiliDownApp {
                     Ok(())
                 }))?;
                 
-                // 使用PowerShell的AUMID进行测试，或者使用自定义的app_id
-                // 首先尝试使用我们注册的app id
                 let app_id = "BilibiliDown.App";
                 let notifier_result = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(app_id));
                 
@@ -720,7 +786,6 @@ impl BilibiliDownApp {
                         n
                     }
                     Err(_) => {
-                        // 如果失败，使用PowerShell的AUMID
                         let powershell_id = "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe";
                         debug_println!("Falling back to PowerShell AUMID: {}", powershell_id);
                         ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(powershell_id))?
@@ -761,7 +826,6 @@ impl eframe::App for BilibiliDownApp {
             while let Ok(url) = receiver.try_recv() {
                 debug_println!("收到通知点击事件，URL: {}", url);
                 
-                // 清理URL，移除parseurl:前缀
                 let clean_url = if url.starts_with("parseurl:") {
                     url[9..].to_string()
                 } else {
@@ -1005,9 +1069,7 @@ impl eframe::App for BilibiliDownApp {
                     }
                     Page::Settings => {
                         let settings_text = self.get_text("settings");
-                        // 修复：在设置改变后重新获取主题
                         if self.settings_page.show_with_text(ui, &settings_text) {
-                            // 重新读取新的主题值
                             let new_theme = self.config.read().theme.clone();
                             self.apply_theme(ctx, &new_theme);
                         }

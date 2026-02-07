@@ -27,7 +27,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         let download_path = dirs::download_dir()
-            .unwrap_or_else(|| PathBuf::from("C:\\"))
+            .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
+            .unwrap_or_else(|| PathBuf::from("."))
             .join("Bilidown");
         
         if !download_path.exists() {
@@ -62,12 +63,24 @@ impl Config {
     
     pub fn save(&self) {
         let config_path = Self::config_path();
+        // 确保配置目录存在
+        if let Some(parent) = config_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
         if let Ok(content) = serde_json::to_string_pretty(self) {
             let _ = fs::write(config_path, content);
         }
     }
     
     fn config_path() -> PathBuf {
+        // 优先使用 XDG/AppData 标准配置目录
+        if let Some(config_dir) = dirs::config_dir() {
+            let app_config = config_dir.join("bilibili-down");
+            let _ = fs::create_dir_all(&app_config);
+            return app_config.join("config.json");
+        }
+        
+        // 回退：使用可执行文件旁边
         std::env::current_exe()
             .unwrap_or_else(|_| PathBuf::from("."))
             .parent()

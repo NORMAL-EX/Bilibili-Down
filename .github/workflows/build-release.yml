@@ -1,0 +1,168 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag name (e.g. v0.2.0)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: bilibili-down-windows-x64
+            binary_ext: .exe
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact_name: bilibili-down-linux-x64
+            binary_ext: ''
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: bilibili-down-macos-x64
+            binary_ext: ''
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: bilibili-down-macos-arm64
+            binary_ext: ''
+
+    runs-on: ${{ matrix.os }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ matrix.target }}-cargo-
+
+      # Linux: 安装 GUI 和系统依赖
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libssl-dev \
+            libdbus-1-dev \
+            pkg-config \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libexpat1-dev \
+            libatk1.0-dev \
+            libcairo2-dev \
+            libpango1.0-dev \
+            libgdk-pixbuf-2.0-dev
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # 打包产物
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dir = "release/${{ matrix.artifact_name }}"
+          New-Item -ItemType Directory -Force -Path $dir
+          Copy-Item "target/${{ matrix.target }}/release/bilibili-down${{ matrix.binary_ext }}" "$dir/"
+          Copy-Item "assets" "$dir/" -Recurse -ErrorAction SilentlyContinue
+          if (Test-Path "tools") { Copy-Item "tools" "$dir/" -Recurse }
+          Copy-Item "LICENSE" "$dir/" -ErrorAction SilentlyContinue
+          Copy-Item "README.md" "$dir/" -ErrorAction SilentlyContinue
+          Compress-Archive -Path "$dir/*" -DestinationPath "release/${{ matrix.artifact_name }}.zip"
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          dir="release/${{ matrix.artifact_name }}"
+          mkdir -p "$dir"
+          cp "target/${{ matrix.target }}/release/bilibili-down${{ matrix.binary_ext }}" "$dir/"
+          cp -r assets "$dir/" 2>/dev/null || true
+          cp LICENSE "$dir/" 2>/dev/null || true
+          cp README.md "$dir/" 2>/dev/null || true
+          chmod +x "$dir/bilibili-down"
+          cd release && tar czf "${{ matrix.artifact_name }}.tar.gz" "${{ matrix.artifact_name }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            release/${{ matrix.artifact_name }}.zip
+            release/${{ matrix.artifact_name }}.tar.gz
+          if-no-files-found: ignore
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Determine tag name
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag_name }}"
+            if [ -z "$TAG" ]; then
+              TAG="v$(date +%Y%m%d-%H%M%S)"
+            fi
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Using tag: $TAG"
+
+      - name: List artifacts
+        run: find artifacts -type f | head -20
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "Bilibili-Down ${{ steps.tag.outputs.tag }}"
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            artifacts/**/*.zip
+            artifacts/**/*.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

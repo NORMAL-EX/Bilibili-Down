@@ -157,7 +157,6 @@ impl DownloadManager {
             
             if Process32First(snapshot, &mut process_entry) != 0 {
                 loop {
-                    // 修复类型转换问题：从 CHAR (i8) 数组转换为 u16 Vec
                     let exe_name_wide: Vec<u16> = process_entry.szExeFile
                         .iter()
                         .take_while(|&&c| c != 0)
@@ -193,8 +192,12 @@ impl DownloadManager {
     }
     
     #[cfg(not(target_os = "windows"))]
-    fn kill_processes_by_name(_process_name: &str) {
-        // 非Windows平台暂不实现
+    fn kill_processes_by_name(process_name: &str) {
+        // 使用 pkill 来终止进程
+        let _ = Command::new("pkill")
+            .arg("-f")
+            .arg(process_name)
+            .output();
     }
     
     fn start_aria2(&mut self) {
@@ -206,7 +209,10 @@ impl DownloadManager {
             return;
         }
         
+        #[cfg(target_os = "windows")]
         Self::kill_processes_by_name("aria2c.exe");
+        #[cfg(not(target_os = "windows"))]
+        Self::kill_processes_by_name("aria2c");
         
         std::thread::sleep(std::time::Duration::from_millis(500));
         
@@ -434,7 +440,33 @@ impl DownloadManager {
         #[cfg(not(target_os = "windows"))]
         let aria2_name = "aria2c";
         
-        exe_dir.join("tools").join(aria2_name)
+        // 先检查 tools 目录
+        let tools_path = exe_dir.join("tools").join(aria2_name);
+        if tools_path.exists() {
+            return tools_path;
+        }
+        
+        // 再检查可执行文件旁边
+        let beside_path = exe_dir.join(aria2_name);
+        if beside_path.exists() {
+            return beside_path;
+        }
+        
+        // 非 Windows 平台：尝试从 PATH 中查找
+        #[cfg(not(target_os = "windows"))]
+        {
+            if let Ok(output) = Command::new("which").arg("aria2c").output() {
+                if output.status.success() {
+                    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if !path.is_empty() {
+                        return PathBuf::from(path);
+                    }
+                }
+            }
+        }
+        
+        // 回退到 tools 目录路径
+        tools_path
     }
     
     fn get_ffmpeg_path() -> PathBuf {
@@ -449,7 +481,32 @@ impl DownloadManager {
         #[cfg(not(target_os = "windows"))]
         let ffmpeg_name = "ffmpeg";
         
-        exe_dir.join("tools").join(ffmpeg_name)
+        // 先检查 tools 目录
+        let tools_path = exe_dir.join("tools").join(ffmpeg_name);
+        if tools_path.exists() {
+            return tools_path;
+        }
+        
+        // 再检查可执行文件旁边
+        let beside_path = exe_dir.join(ffmpeg_name);
+        if beside_path.exists() {
+            return beside_path;
+        }
+        
+        // 非 Windows 平台：尝试从 PATH 中查找
+        #[cfg(not(target_os = "windows"))]
+        {
+            if let Ok(output) = Command::new("which").arg("ffmpeg").output() {
+                if output.status.success() {
+                    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if !path.is_empty() {
+                        return PathBuf::from(path);
+                    }
+                }
+            }
+        }
+        
+        tools_path
     }
     
     pub fn get_config(&self) -> Arc<RwLock<Config>> {

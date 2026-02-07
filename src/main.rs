@@ -79,21 +79,41 @@ fn main() -> Result<(), eframe::Error> {
 }
 
 fn load_icon() -> egui::IconData {
-    let icon_bytes = include_bytes!("../assets/bilibili.ico");
+    #[cfg(target_os = "windows")]
+    {
+        let icon_bytes = include_bytes!("../assets/bilibili.ico");
 
-    let icon_dir = ico::IconDir::read(std::io::Cursor::new(icon_bytes))
-        .unwrap_or_else(|_| ico::IconDir::new(ico::ResourceType::Icon));
+        let icon_dir = ico::IconDir::read(std::io::Cursor::new(icon_bytes))
+            .unwrap_or_else(|_| ico::IconDir::new(ico::ResourceType::Icon));
 
-    if let Some(entry) = icon_dir.entries().first() {
-        if let Ok(image) = entry.decode() {
-            let rgba = image.rgba_data().to_vec();
-            let width = image.width();
-            let height = image.height();
+        if let Some(entry) = icon_dir.entries().first() {
+            if let Ok(image) = entry.decode() {
+                let rgba = image.rgba_data().to_vec();
+                let width = image.width();
+                let height = image.height();
 
-            return egui::IconData { rgba, width, height };
+                return egui::IconData { rgba, width, height };
+            }
         }
     }
 
+    #[cfg(not(target_os = "windows"))]
+    {
+        // 非Windows平台尝试加载PNG图标
+        let png_bytes = include_bytes!("../assets/bilibili.png");
+        if let Ok(img) = image::load_from_memory(png_bytes) {
+            let rgba = img.to_rgba8();
+            let width = rgba.width();
+            let height = rgba.height();
+            return egui::IconData {
+                rgba: rgba.into_raw(),
+                width,
+                height,
+            };
+        }
+    }
+
+    // 回退：生成纯色图标
     egui::IconData {
         rgba: vec![255; 32 * 32 * 4],
         width: 32,

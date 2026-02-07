@@ -1,11 +1,11 @@
 [package]
 name = "bilibili-down"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 
 [package.metadata.winresource]
 OriginalFilename = "bilibili-down.exe"
-LegalCopyright = "Copyright Â© NORMAL-EX 2025-present"
+LegalCopyright = "Copyright © NORMAL-EX 2025-present"
 
 [dependencies]
 md5 = "0.7"
@@ -32,26 +32,26 @@ rfd = "0.15"
 env_logger = "0.11"
 uuid = { version = "1.11", features = ["v4"] }
 aria2-ws = "0.2"
-winreg = "0.52"
-clipboard = "0.5"
+arboard = "3.4"
 lazy_static = "1.4"
-win-toast-notify = "0.1.6"
 urlencoding = "2.1"
-ico = "0.3"
-winit = "0.29"  # 添加winit依赖来获取窗口句柄
+winit = "0.29"
 
 [target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+ico = "0.3"
+win-toast-notify = "0.1.6"
 winapi = { version = "0.3", features = [
     "tlhelp32",
-    "processthreadsapi", 
+    "processthreadsapi",
     "handleapi",
     "winnt",
     "minwindef",
     "winbase",
     "shellapi",
     "shobjidl_core",
-    "dwmapi",  # 添加dwmapi特性
-    "winuser"  # 添加winuser特性用于获取窗口句柄
+    "dwmapi",
+    "winuser"
 ]}
 windows = { version = "0.52", features = [
     "Foundation",
@@ -61,6 +61,12 @@ windows = { version = "0.52", features = [
 
 [target.'cfg(not(windows))'.dependencies]
 notify-rust = "4.11"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+png = "0.17"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+png = "0.17"
 
 [build-dependencies]
 winresource = "0.1"
