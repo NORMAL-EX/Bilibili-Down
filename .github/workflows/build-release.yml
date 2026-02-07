@@ -16,6 +16,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  ARIA2_VERSION: "1.37.0"
 
 jobs:
   build:
@@ -41,7 +42,7 @@ jobs:
             binary_ext: ''
 
     runs-on: ${{ matrix.os }}
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -87,31 +88,85 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
-      # 打包产物
+      # ====== 下载对应平台的 aria2c ======
+      - name: Download aria2c (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/aria2/aria2/releases/download/release-${{ env.ARIA2_VERSION }}/aria2-${{ env.ARIA2_VERSION }}-win-64bit-build1.zip"
+          Invoke-WebRequest -Uri $url -OutFile aria2.zip
+          Expand-Archive aria2.zip -DestinationPath aria2_tmp
+          $aria2 = Get-ChildItem -Path aria2_tmp -Recurse -Filter "aria2c.exe" | Select-Object -First 1
+          New-Item -ItemType Directory -Force -Path "release_tools"
+          Copy-Item $aria2.FullName "release_tools/aria2c.exe"
+          Write-Host "aria2c.exe ready"
+
+      - name: Download aria2c (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p release_tools aria2_tmp
+          # 尝试下载静态编译版本
+          wget -q "https://github.com/abcfy2/aria2-static-build/releases/latest/download/aria2-x86_64-linux-musl_static.zip" -O aria2.zip && \
+            unzip -o aria2.zip -d aria2_tmp && \
+            find aria2_tmp -name "aria2c" -type f -exec cp {} release_tools/aria2c \; || true
+          
+          # 如果上面失败，使用系统包
+          if [ ! -f release_tools/aria2c ]; then
+            sudo apt-get install -y aria2
+            cp $(which aria2c) release_tools/aria2c
+          fi
+          
+          chmod +x release_tools/aria2c
+          echo "aria2c ready"
+
+      - name: Download aria2c (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install aria2
+          mkdir -p release_tools
+          cp $(which aria2c) release_tools/aria2c
+          chmod +x release_tools/aria2c
+          echo "aria2c ready"
+
+      # ====== 打包产物 ======
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $dir = "release/${{ matrix.artifact_name }}"
-          New-Item -ItemType Directory -Force -Path $dir
+          New-Item -ItemType Directory -Force -Path "$dir/tools"
+          
           Copy-Item "target/${{ matrix.target }}/release/bilibili-down${{ matrix.binary_ext }}" "$dir/"
+          Copy-Item "release_tools/aria2c.exe" "$dir/tools/"
           Copy-Item "assets" "$dir/" -Recurse -ErrorAction SilentlyContinue
-          if (Test-Path "tools") { Copy-Item "tools" "$dir/" -Recurse }
           Copy-Item "LICENSE" "$dir/" -ErrorAction SilentlyContinue
           Copy-Item "README.md" "$dir/" -ErrorAction SilentlyContinue
+          
           Compress-Archive -Path "$dir/*" -DestinationPath "release/${{ matrix.artifact_name }}.zip"
+          
+          Write-Host "=== Package contents ==="
+          Get-ChildItem -Recurse "$dir" | ForEach-Object { Write-Host $_.FullName }
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
           dir="release/${{ matrix.artifact_name }}"
-          mkdir -p "$dir"
+          mkdir -p "$dir/tools"
+          
           cp "target/${{ matrix.target }}/release/bilibili-down${{ matrix.binary_ext }}" "$dir/"
+          chmod +x "$dir/bilibili-down"
+          
+          cp release_tools/aria2c "$dir/tools/"
+          chmod +x "$dir/tools/aria2c"
+          
           cp -r assets "$dir/" 2>/dev/null || true
           cp LICENSE "$dir/" 2>/dev/null || true
           cp README.md "$dir/" 2>/dev/null || true
-          chmod +x "$dir/bilibili-down"
+          
           cd release && tar czf "${{ matrix.artifact_name }}.tar.gz" "${{ matrix.artifact_name }}"
+          
+          echo "=== Package contents ==="
+          find "${{ matrix.artifact_name }}" -type f
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -126,7 +181,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -148,10 +203,9 @@ jobs:
             TAG="${GITHUB_REF#refs/tags/}"
           fi
           echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "Using tag: $TAG"
 
       - name: List artifacts
-        run: find artifacts -type f | head -20
+        run: find artifacts -type f
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
