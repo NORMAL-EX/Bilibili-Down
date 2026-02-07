@@ -87,22 +87,36 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
-      # ====== 下载对应平台的 aria2c ======
-      - name: Download aria2c (Windows)
+      # ====== 下载 aria2c + ffmpeg ======
+      - name: Download tools (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $url = "https://github.com/aria2/aria2/releases/download/release-${{ env.ARIA2_VERSION }}/aria2-${{ env.ARIA2_VERSION }}-win-64bit-build1.zip"
-          Invoke-WebRequest -Uri $url -OutFile aria2.zip
+          New-Item -ItemType Directory -Force -Path "release_tools"
+
+          # aria2c
+          $aria2Url = "https://github.com/aria2/aria2/releases/download/release-${{ env.ARIA2_VERSION }}/aria2-${{ env.ARIA2_VERSION }}-win-64bit-build1.zip"
+          Invoke-WebRequest -Uri $aria2Url -OutFile aria2.zip
           Expand-Archive aria2.zip -DestinationPath aria2_tmp
           $aria2 = Get-ChildItem -Path aria2_tmp -Recurse -Filter "aria2c.exe" | Select-Object -First 1
-          New-Item -ItemType Directory -Force -Path "release_tools"
           Copy-Item $aria2.FullName "release_tools/aria2c.exe"
+          Write-Host "aria2c.exe ready"
 
-      - name: Download aria2c (Linux)
+          # ffmpeg (使用 gyan.dev 的 essentials build)
+          $ffmpegUrl = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+          Invoke-WebRequest -Uri $ffmpegUrl -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_tmp
+          $ffmpeg = Get-ChildItem -Path ffmpeg_tmp -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
+          Copy-Item $ffmpeg.FullName "release_tools/ffmpeg.exe"
+          Write-Host "ffmpeg.exe ready"
+
+      - name: Download tools (Linux)
         if: runner.os == 'Linux'
         run: |
-          mkdir -p release_tools aria2_tmp
+          mkdir -p release_tools
+
+          # aria2c
+          mkdir -p aria2_tmp
           wget -q "https://github.com/abcfy2/aria2-static-build/releases/latest/download/aria2-x86_64-linux-musl_static.zip" -O aria2.zip && \
             unzip -o aria2.zip -d aria2_tmp && \
             find aria2_tmp -name "aria2c" -type f -exec cp {} release_tools/aria2c \; || true
@@ -111,14 +125,44 @@ jobs:
             cp $(which aria2c) release_tools/aria2c
           fi
           chmod +x release_tools/aria2c
+          echo "aria2c ready"
 
-      - name: Download aria2c (macOS)
+          # ffmpeg (使用 johnvansickle 的静态编译版)
+          wget -q "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz" -O ffmpeg.tar.xz || \
+          wget -q "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-linux64-gpl.tar.xz" -O ffmpeg.tar.xz || true
+          if [ -f ffmpeg.tar.xz ]; then
+            mkdir -p ffmpeg_tmp
+            tar xf ffmpeg.tar.xz -C ffmpeg_tmp
+            FFMPEG_BIN=$(find ffmpeg_tmp -name "ffmpeg" -type f | head -1)
+            if [ -n "$FFMPEG_BIN" ]; then
+              cp "$FFMPEG_BIN" release_tools/ffmpeg
+              chmod +x release_tools/ffmpeg
+            fi
+          fi
+          # 兜底：用系统包
+          if [ ! -f release_tools/ffmpeg ]; then
+            sudo apt-get install -y ffmpeg
+            cp $(which ffmpeg) release_tools/ffmpeg
+          fi
+          chmod +x release_tools/ffmpeg
+          echo "ffmpeg ready"
+
+      - name: Download tools (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install aria2
           mkdir -p release_tools
+
+          # aria2c
+          brew install aria2
           cp $(which aria2c) release_tools/aria2c
           chmod +x release_tools/aria2c
+          echo "aria2c ready"
+
+          # ffmpeg
+          brew install ffmpeg
+          cp $(which ffmpeg) release_tools/ffmpeg
+          chmod +x release_tools/ffmpeg
+          echo "ffmpeg ready"
 
       # ====== 打包产物 ======
       - name: Package (Windows)
@@ -130,13 +174,14 @@ jobs:
 
           Copy-Item "target/${{ matrix.target }}/release/bilibili-down${{ matrix.binary_ext }}" "$dir/"
           Copy-Item "release_tools/aria2c.exe" "$dir/tools/"
+          Copy-Item "release_tools/ffmpeg.exe" "$dir/tools/"
           Copy-Item "LICENSE" "$dir/" -ErrorAction SilentlyContinue
           Copy-Item "README.md" "$dir/" -ErrorAction SilentlyContinue
 
           Compress-Archive -Path "$dir/*" -DestinationPath "release/${{ matrix.artifact_name }}.zip"
 
           Write-Host "=== Package contents ==="
-          Get-ChildItem -Recurse "$dir" | ForEach-Object { Write-Host $_.FullName }
+          Get-ChildItem -Recurse "$dir" | ForEach-Object { Write-Host "$($_.FullName) ($([math]::Round($_.Length/1MB, 2)) MB)" }
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -148,7 +193,9 @@ jobs:
           chmod +x "$dir/bilibili-down"
 
           cp release_tools/aria2c "$dir/tools/"
+          cp release_tools/ffmpeg "$dir/tools/"
           chmod +x "$dir/tools/aria2c"
+          chmod +x "$dir/tools/ffmpeg"
 
           cp LICENSE "$dir/" 2>/dev/null || true
           cp README.md "$dir/" 2>/dev/null || true
@@ -156,7 +203,7 @@ jobs:
           cd release && tar czf "${{ matrix.artifact_name }}.tar.gz" "${{ matrix.artifact_name }}"
 
           echo "=== Package contents ==="
-          find "${{ matrix.artifact_name }}" -type f
+          find "${{ matrix.artifact_name }}" -type f -exec ls -lh {} \;
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -195,7 +242,7 @@ jobs:
           echo "tag=$TAG" >> $GITHUB_OUTPUT
 
       - name: List artifacts
-        run: find artifacts -type f
+        run: find artifacts -type f -exec ls -lh {} \;
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
