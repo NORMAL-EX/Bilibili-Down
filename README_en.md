@@ -29,7 +29,7 @@ https://bilibili-down.github.io
 
 ### System Requirements
 
-- Windows 10/11
+- Windows / macOS / Linux
 - Internet connection
 
 ### Installation
@@ -53,18 +53,18 @@ https://bilibili-down.github.io
 
 ```
 bilibili-down/
-├── bilibili-down.exe    # Main program
-├── config.json          # Configuration file (auto-generated)
+├── bilibili-down   # Main program
+├── config.json     # Configuration file (auto-generated)
 └── tools/
-   ├── aria2c.exe       # Download tool (included)
-   └── ffmpeg.exe       # Video processing tool (included)
+   ├── aria2c       # Download tool (included)
+   └── ffmpeg       # Video processing tool (included)
 ```
 
 ## 📖 Usage Guide
 
 ### Basic Usage
 
-1. **Start Program** - Double-click `bilibili-down.exe`
+1. **Start Program** - Double-click `bilibili-down`
 
 2. **Input Video Information**
    - Support BV ID: `BV1xx411c7mD`
@@ -206,5 +206,6 @@ If you like this project, please give it a ⭐!
 - 📖 [View Documentation](../../wiki)
 
 ---
+
 
 *Last updated: December 7, 2025*
