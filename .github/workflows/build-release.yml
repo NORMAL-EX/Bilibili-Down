@@ -323,6 +323,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          token: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
           tag_name: ${{ steps.tag.outputs.tag }}
           name: "Bilibili-Down ${{ steps.tag.outputs.tag }}"
           draft: false
