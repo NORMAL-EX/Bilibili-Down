@@ -328,7 +328,6 @@ jobs:
           name: "Bilibili-Down ${{ steps.tag.outputs.tag }}"
           draft: false
           prerelease: false
-          generate_release_notes: true
           files: |
             artifacts/**/*.zip
             artifacts/**/*.tar.gz
