@@ -1,0 +1,133 @@
+name: Codex via @mention
+
+on:
+  issues:
+    types: [opened, edited]
+  issue_comment:
+    types: [created]
+  pull_request:
+    types: [opened, edited]
+  pull_request_review_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  codex:
+    # 仅当文本里包含 @codex 才运行（支持正文/评论/PR/review comment）
+    if: |
+      (github.event_name == 'issues' && contains(github.event.issue.body, '@codex')) ||
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@codex')) ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.body, '@codex')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@codex'))
+    runs-on: ubuntu-latest
+    outputs:
+      final_message: ${{ steps.run_codex.outputs.final-message }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build prompt from event payload
+        id: build_prompt
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EVENT_NAME="${{ github.event_name }}"
+          EVENT_PATH="${GITHUB_EVENT_PATH}"
+
+          # 用 jq 从 GitHub 事件 payload 提取信息（runner 默认带 jq）
+          repo="${{ github.repository }}"
+          actor="${{ github.actor }}"
+
+          # 统一取“触发文本”（正文或评论）
+          text="$(jq -r '
+            if .issue? and (.comment? | not) then .issue.body
+            elif .comment? then .comment.body
+            elif .pull_request? and (.comment? | not) then .pull_request.body
+            else "" end
+          ' "$EVENT_PATH")"
+
+          title="$(jq -r '
+            if .issue? and (.pull_request? | not) then .issue.title
+            elif .pull_request? then .pull_request.title
+            else "" end
+          ' "$EVENT_PATH")"
+
+          url="$(jq -r '
+            if .issue? and (.pull_request? | not) then .issue.html_url
+            elif .pull_request? then .pull_request.html_url
+            else "" end
+          ' "$EVENT_PATH")"
+
+          # issue_comment 既可能是 issue comment 也可能是 PR conversation comment
+          is_pr_comment="$(jq -r '(.issue.pull_request? != null) // false' "$EVENT_PATH" 2>/dev/null || echo false)"
+          if [[ "$EVENT_NAME" == "issue_comment" && "$is_pr_comment" == "true" ]]; then
+            # PR conversation comment：url 用 issue.html_url（就是 PR 链接）
+            url="$(jq -r '.issue.html_url' "$EVENT_PATH")"
+            title="$(jq -r '.issue.title' "$EVENT_PATH")"
+          fi
+
+          # 生成 prompt 文件
+          cat > /tmp/codex_prompt.txt <<EOF
+          You are Codex running in a GitHub Actions workflow.
+          Repository: ${repo}
+          Triggered by: ${actor}
+          Link: ${url}
+          Title: ${title}
+
+          The user message (contains @codex). Follow the user's request.
+          If the request is ambiguous, ask ONE clarifying question in your reply.
+          Be concise and actionable.
+
+          ----
+          ${text}
+          EOF
+
+          echo "prompt_file=/tmp/codex_prompt.txt" >> "$GITHUB_OUTPUT"
+
+      - name: Run Codex
+        id: run_codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: ${{ steps.build_prompt.outputs.prompt_file }}
+          # 更安全：只读；如果你希望它直接改代码并开 PR，再改成 workspace-write
+          sandbox: read-only
+
+      - name: Post reply as a comment (Issue/PR conversation)
+        if: steps.run_codex.outputs.final-message != ''
+        uses: actions/github-script@v7
+        env:
+          CODEX_FINAL_MESSAGE: ${{ steps.run_codex.outputs.final-message }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const body = process.env.CODEX_FINAL_MESSAGE;
+
+            // issue_comment / issues / pull_request 都可以用 issues.createComment（PR 也算 issue）
+            let issue_number = null;
+
+            if (context.payload.issue?.number) issue_number = context.payload.issue.number;
+            if (context.payload.pull_request?.number) issue_number = context.payload.pull_request.number;
+
+            // pull_request_review_comment：payload 里有 pull_request 但不总是直接给 number
+            if (!issue_number && context.payload.pull_request?.url) {
+              // fallback：尽量取 PR number（多数情况下 context.payload.pull_request.number 存在）
+              issue_number = context.payload.pull_request.number;
+            }
+
+            if (!issue_number) {
+              core.warning("Could not determine issue/PR number to comment on.");
+              return;
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number,
+              body,
+            });
