@@ -1,0 +1,335 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag name (e.g. v0.2.0)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  ARIA2_VERSION: "1.37.0"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: bilibili-down-windows-x64
+            binary_ext: .exe
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact_name: bilibili-down-linux-x64
+            binary_ext: ''
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: bilibili-down-macos-x64
+            binary_ext: ''
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: bilibili-down-macos-arm64
+            binary_ext: ''
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ matrix.target }}-cargo-
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libssl-dev \
+            libdbus-1-dev \
+            pkg-config \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libexpat1-dev \
+            libatk1.0-dev \
+            libcairo2-dev \
+            libpango1.0-dev \
+            libgdk-pixbuf-2.0-dev
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # ====== Windows: 下载 aria2c + ffmpeg ======
+      - name: Download tools (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "release_tools"
+
+          # aria2c
+          $aria2Url = "https://github.com/aria2/aria2/releases/download/release-${{ env.ARIA2_VERSION }}/aria2-${{ env.ARIA2_VERSION }}-win-64bit-build1.zip"
+          Invoke-WebRequest -Uri $aria2Url -OutFile aria2.zip
+          Expand-Archive aria2.zip -DestinationPath aria2_tmp
+          $aria2 = Get-ChildItem -Path aria2_tmp -Recurse -Filter "aria2c.exe" | Select-Object -First 1
+          Copy-Item $aria2.FullName "release_tools/aria2c.exe"
+          Write-Host "aria2c.exe ready: $((Get-Item release_tools/aria2c.exe).Length / 1MB) MB"
+
+          # ffmpeg (gyan.dev essentials build)
+          $ffmpegUrl = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+          Invoke-WebRequest -Uri $ffmpegUrl -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_tmp
+          $ffmpeg = Get-ChildItem -Path ffmpeg_tmp -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
+          Copy-Item $ffmpeg.FullName "release_tools/ffmpeg.exe"
+          Write-Host "ffmpeg.exe ready: $((Get-Item release_tools/ffmpeg.exe).Length / 1MB) MB"
+
+      # ====== Linux: 下载静态编译版 aria2c + ffmpeg ======
+      - name: Download tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p release_tools
+
+          # aria2c (静态编译)
+          mkdir -p aria2_tmp
+          wget -q "https://github.com/abcfy2/aria2-static-build/releases/latest/download/aria2-x86_64-linux-musl_static.zip" -O aria2.zip && \
+            unzip -o aria2.zip -d aria2_tmp && \
+            find aria2_tmp -name "aria2c" -type f -exec cp {} release_tools/aria2c \; || true
+          if [ ! -f release_tools/aria2c ]; then
+            sudo apt-get install -y aria2
+            cp $(which aria2c) release_tools/aria2c
+          fi
+          chmod +x release_tools/aria2c
+          echo "aria2c ready: $(du -h release_tools/aria2c | cut -f1)"
+
+          # ffmpeg (静态编译)
+          wget -q "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz" -O ffmpeg.tar.xz || \
+          wget -q "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-linux64-gpl.tar.xz" -O ffmpeg.tar.xz || true
+          if [ -f ffmpeg.tar.xz ]; then
+            mkdir -p ffmpeg_tmp
+            tar xf ffmpeg.tar.xz -C ffmpeg_tmp
+            FFMPEG_BIN=$(find ffmpeg_tmp -name "ffmpeg" -type f -executable | head -1)
+            if [ -n "$FFMPEG_BIN" ]; then
+              cp "$FFMPEG_BIN" release_tools/ffmpeg
+            fi
+          fi
+          if [ ! -f release_tools/ffmpeg ]; then
+            sudo apt-get install -y ffmpeg
+            cp $(which ffmpeg) release_tools/ffmpeg
+          fi
+          chmod +x release_tools/ffmpeg
+          echo "ffmpeg ready: $(du -h release_tools/ffmpeg | cut -f1)"
+
+      # ====== macOS: 下载静态编译版 + brew 打包动态库 ======
+      - name: Download tools (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p release_tools
+          ARCH="${{ matrix.target }}"
+
+          # ---- ffmpeg: 从 evermeet.cx 下载静态编译版 ----
+          echo "Downloading static ffmpeg for macOS..."
+          if [[ "$ARCH" == *"aarch64"* ]]; then
+            # arm64
+            curl -L "https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip/arm64" -o ffmpeg.zip || \
+            curl -L "https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip" -o ffmpeg.zip || true
+          else
+            # x86_64
+            curl -L "https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip" -o ffmpeg.zip || true
+          fi
+
+          if [ -f ffmpeg.zip ] && [ -s ffmpeg.zip ]; then
+            unzip -o ffmpeg.zip -d ffmpeg_tmp 2>/dev/null || true
+            if [ -f ffmpeg_tmp/ffmpeg ]; then
+              cp ffmpeg_tmp/ffmpeg release_tools/ffmpeg
+              echo "ffmpeg from evermeet.cx"
+            elif [ -f ffmpeg ]; then
+              # 有些zip直接解压到当前目录
+              cp ffmpeg release_tools/ffmpeg
+              echo "ffmpeg from evermeet.cx (flat)"
+            fi
+          fi
+
+          # 如果 evermeet 下载失败，用 brew + 打包动态库
+          if [ ! -f release_tools/ffmpeg ]; then
+            echo "evermeet.cx failed, falling back to brew + dylib bundling..."
+            brew install ffmpeg
+            FFMPEG_BIN=$(which ffmpeg)
+            cp "$FFMPEG_BIN" release_tools/ffmpeg
+
+            # 复制所有 homebrew 动态库依赖
+            echo "Bundling dylibs..."
+            otool -L "$FFMPEG_BIN" | awk '/homebrew|opt/{print $1}' | while read lib; do
+              if [ -f "$lib" ]; then
+                cp "$lib" release_tools/
+                LIB_NAME=$(basename "$lib")
+                install_name_tool -change "$lib" "@executable_path/$LIB_NAME" release_tools/ffmpeg 2>/dev/null || true
+              fi
+            done
+          fi
+          chmod +x release_tools/ffmpeg
+          echo "ffmpeg ready: $(du -h release_tools/ffmpeg | cut -f1)"
+
+          # ---- aria2c: brew + 打包动态库 ----
+          echo "Installing aria2c..."
+          brew install aria2
+          ARIA2_BIN=$(which aria2c)
+          cp "$ARIA2_BIN" release_tools/aria2c
+
+          # 复制所有 homebrew 动态库依赖
+          echo "Bundling aria2c dylibs..."
+          otool -L "$ARIA2_BIN" | awk '/homebrew|opt/{print $1}' | while read lib; do
+            if [ -f "$lib" ]; then
+              DEST="release_tools/$(basename $lib)"
+              if [ ! -f "$DEST" ]; then
+                cp "$lib" "$DEST"
+              fi
+              install_name_tool -change "$lib" "@executable_path/$(basename $lib)" release_tools/aria2c 2>/dev/null || true
+            fi
+          done
+
+          # 递归处理 dylib 的依赖（dylib 也可能依赖其他 dylib）
+          echo "Resolving transitive dylib dependencies..."
+          for i in 1 2 3; do
+            for dylib in release_tools/*.dylib; do
+              [ -f "$dylib" ] || continue
+              otool -L "$dylib" | awk '/homebrew|opt/{print $1}' | while read lib; do
+                DEST="release_tools/$(basename $lib)"
+                if [ -f "$lib" ] && [ ! -f "$DEST" ]; then
+                  cp "$lib" "$DEST"
+                fi
+                install_name_tool -change "$lib" "@executable_path/$(basename $lib)" "$dylib" 2>/dev/null || true
+              done
+            done
+          done
+
+          chmod +x release_tools/aria2c
+          echo "aria2c ready: $(du -h release_tools/aria2c | cut -f1)"
+          echo "=== release_tools contents ==="
+          ls -lh release_tools/
+
+      # ====== 打包产物 ======
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dir = "release/${{ matrix.artifact_name }}"
+          New-Item -ItemType Directory -Force -Path "$dir/tools"
+
+          Copy-Item "target/${{ matrix.target }}/release/bilibili-down${{ matrix.binary_ext }}" "$dir/"
+          Copy-Item "release_tools/aria2c.exe" "$dir/tools/"
+          Copy-Item "release_tools/ffmpeg.exe" "$dir/tools/"
+          Copy-Item "LICENSE" "$dir/" -ErrorAction SilentlyContinue
+          Copy-Item "README.md" "$dir/" -ErrorAction SilentlyContinue
+
+          Compress-Archive -Path "$dir/*" -DestinationPath "release/${{ matrix.artifact_name }}.zip"
+
+          Write-Host "=== Package contents ==="
+          Get-ChildItem -Recurse "$dir" | ForEach-Object { Write-Host "$($_.FullName) ($([math]::Round($_.Length/1MB, 2)) MB)" }
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          dir="release/${{ matrix.artifact_name }}"
+          mkdir -p "$dir/tools"
+
+          # 主程序
+          cp "target/${{ matrix.target }}/release/bilibili-down${{ matrix.binary_ext }}" "$dir/"
+          chmod +x "$dir/bilibili-down"
+
+          # 工具：复制 aria2c, ffmpeg 和所有 dylib
+          cp release_tools/aria2c "$dir/tools/"
+          cp release_tools/ffmpeg "$dir/tools/"
+          # macOS: 复制打包的 dylib
+          if ls release_tools/*.dylib 1>/dev/null 2>&1; then
+            cp release_tools/*.dylib "$dir/tools/"
+          fi
+          chmod +x "$dir/tools/aria2c"
+          chmod +x "$dir/tools/ffmpeg"
+
+          cp LICENSE "$dir/" 2>/dev/null || true
+          cp README.md "$dir/" 2>/dev/null || true
+
+          cd release && tar czf "${{ matrix.artifact_name }}.tar.gz" "${{ matrix.artifact_name }}"
+
+          echo "=== Package contents ==="
+          find "${{ matrix.artifact_name }}" -type f -exec ls -lh {} \;
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            release/${{ matrix.artifact_name }}.zip
+            release/${{ matrix.artifact_name }}.tar.gz
+          if-no-files-found: ignore
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Determine tag name
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag_name }}"
+            if [ -z "$TAG" ]; then
+              TAG="v$(date +%Y%m%d-%H%M%S)"
+            fi
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: List artifacts
+        run: find artifacts -type f -exec ls -lh {} \;
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "Bilibili-Down ${{ steps.tag.outputs.tag }}"
+          draft: false
+          prerelease: false
+          files: |
+            artifacts/**/*.zip
+            artifacts/**/*.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
