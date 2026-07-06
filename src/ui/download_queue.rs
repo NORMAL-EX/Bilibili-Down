@@ -331,6 +331,9 @@ impl DownloadQueuePage {
                         
                         ui.add_space(5.0);
                         ui.horizontal(|ui| {
+                            if ui.button(resume_text).clicked() {
+                                action = Some((task_id.clone(), "resume".to_string()));
+                            }
                             if ui.button(egui::RichText::new(delete_text)
                                 .color(egui::Color32::from_rgb(255, 100, 100)))
                                 .clicked() {

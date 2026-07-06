@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::runtime::Runtime;
+use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
 
 #[cfg(debug_assertions)]
 macro_rules! debug_println {
@@ -269,6 +270,38 @@ impl BilibiliApi {
         format!("{}&w_rid={}", query, w_rid)
     }
 
+    fn add_dm_params(params: &mut BTreeMap<String, String>) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let seed = (now % 997) as u32;
+
+        let dm_img_str = STANDARD_NO_PAD.encode(format!(
+            "Windows Chrome {} {}",
+            1920 + seed % 17,
+            1080 + seed % 11
+        ));
+        let dm_cover_img_str = STANDARD_NO_PAD.encode(format!(
+            "Canvas WebGL ANGLE Intel Direct3D11 {}",
+            seed
+        ));
+        let dm_img_inter = format!(
+            "{{\"ds\":[],\"wh\":[{},{},{}],\"of\":[{},{},{}]}}",
+            4920 + seed,
+            6912 + seed,
+            108 + seed % 114,
+            50 + seed % 100,
+            seed % 17,
+            514 + seed % 514
+        );
+
+        params.insert("dm_img_list".to_string(), "[]".to_string());
+        params.insert("dm_img_str".to_string(), dm_img_str);
+        params.insert("dm_cover_img_str".to_string(), dm_cover_img_str);
+        params.insert("dm_img_inter".to_string(), dm_img_inter);
+    }
+
     fn extract_wbi_key(url: &str) -> Option<String> {
         url.rsplit('/')
             .next()
@@ -466,7 +499,7 @@ impl BilibiliApi {
     ) -> Result<Vec<QualityInfo>, String> {
         let keys_opt = self.update_wbi_keys().await.ok();
 
-        let (url, signed_query) = if let Some((img_key, sub_key)) = keys_opt {
+        let url = if let Some((img_key, sub_key)) = keys_opt {
             let mut params = BTreeMap::new();
             params.insert("bvid".to_string(), bvid.to_string());
             params.insert("cid".to_string(), cid.to_string());
@@ -474,20 +507,15 @@ impl BilibiliApi {
             params.insert("fnval".to_string(), "4048".to_string());
             params.insert("fourk".to_string(), "1".to_string());
             params.insert("try_look".to_string(), "1".to_string());
+            Self::add_dm_params(&mut params);
 
             let query = Self::encode_wbi(&params, &img_key, &sub_key);
-            (
-                format!("https://api.bilibili.com/x/player/wbi/playurl?{}", query),
-                None::<egui::Key>,
-            )
+            format!("https://api.bilibili.com/x/player/wbi/playurl?{}", query)
         } else {
             // Fallback
-            (
-                format!(
+            format!(
                 "https://api.bilibili.com/x/player/playurl?bvid={}&cid={}&qn=80&fnval=4048&fourk=1",
                 bvid, cid
-            ),
-                None,
             )
         };
 
@@ -625,6 +653,7 @@ impl BilibiliApi {
             params.insert("fnval".to_string(), "4048".to_string());
             params.insert("fourk".to_string(), "1".to_string());
             params.insert("try_look".to_string(), "1".to_string()); // 关键
+            Self::add_dm_params(&mut params);
 
             let query = Self::encode_wbi(&params, &img_key, &sub_key);
             format!("https://api.bilibili.com/x/player/wbi/playurl?{}", query)
@@ -700,6 +729,7 @@ impl BilibiliApi {
             params.insert("fnval".to_string(), "4048".to_string());
             params.insert("fourk".to_string(), "1".to_string());
             params.insert("try_look".to_string(), "1".to_string()); // 关键：免登录高画质
+            Self::add_dm_params(&mut params);
 
             let query = Self::encode_wbi(&params, &img_key, &sub_key);
             format!("https://api.bilibili.com/x/player/wbi/playurl?{}", query)

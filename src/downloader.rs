@@ -8,7 +8,9 @@ use crate::config::Config;
 use std::process::Command;
 use aria2_ws::{Client as Aria2Client, TaskOptions};
 use aria2_ws::response::TaskStatus;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -74,6 +76,7 @@ pub struct DownloadTask {
     pub video_gid: Option<String>,
     pub audio_gid: Option<String>,
     pub has_audio: bool,
+    pub created_at: i64,
 }
 
 impl DownloadTask {
@@ -93,6 +96,105 @@ impl DownloadTask {
             video_gid: None,
             audio_gid: None,
             has_audio: false,
+            created_at: Self::now_millis(),
+        }
+    }
+
+    fn now_millis() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+            .unwrap_or(0)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state", content = "data")]
+enum PersistedDownloadStatus {
+    Waiting,
+    Paused,
+    Completed,
+    Failed(String),
+}
+
+impl From<&DownloadStatus> for PersistedDownloadStatus {
+    fn from(status: &DownloadStatus) -> Self {
+        match status {
+            DownloadStatus::Waiting => Self::Waiting,
+            DownloadStatus::Downloading { .. } | DownloadStatus::Merging { .. } => Self::Paused,
+            DownloadStatus::Paused => Self::Paused,
+            DownloadStatus::Completed => Self::Completed,
+            DownloadStatus::Failed(err) => Self::Failed(err.clone()),
+        }
+    }
+}
+
+impl From<PersistedDownloadStatus> for DownloadStatus {
+    fn from(status: PersistedDownloadStatus) -> Self {
+        match status {
+            PersistedDownloadStatus::Waiting => DownloadStatus::Paused,
+            PersistedDownloadStatus::Paused => DownloadStatus::Paused,
+            PersistedDownloadStatus::Completed => DownloadStatus::Completed,
+            PersistedDownloadStatus::Failed(err) => DownloadStatus::Failed(err),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedDownloadTask {
+    id: String,
+    title: String,
+    author: String,
+    cover: String,
+    quality: u32,
+    is_mp3: bool,
+    status: PersistedDownloadStatus,
+    video_path: Option<PathBuf>,
+    audio_path: Option<PathBuf>,
+    output_path: Option<PathBuf>,
+    cid: u64,
+    has_audio: bool,
+    created_at: i64,
+}
+
+impl From<&DownloadTask> for PersistedDownloadTask {
+    fn from(task: &DownloadTask) -> Self {
+        Self {
+            id: task.id.clone(),
+            title: task.title.clone(),
+            author: task.author.clone(),
+            cover: task.cover.clone(),
+            quality: task.quality,
+            is_mp3: task.is_mp3,
+            status: PersistedDownloadStatus::from(&*task.status.read()),
+            video_path: task.video_path.clone(),
+            audio_path: task.audio_path.clone(),
+            output_path: task.output_path.clone(),
+            cid: task.cid,
+            has_audio: task.has_audio,
+            created_at: task.created_at,
+        }
+    }
+}
+
+impl From<PersistedDownloadTask> for DownloadTask {
+    fn from(task: PersistedDownloadTask) -> Self {
+        Self {
+            id: task.id,
+            title: task.title,
+            author: task.author,
+            cover: task.cover,
+            quality: task.quality,
+            is_mp3: task.is_mp3,
+            status: Arc::new(RwLock::new(DownloadStatus::from(task.status))),
+            video_path: task.video_path,
+            audio_path: task.audio_path,
+            output_path: task.output_path,
+            cid: task.cid,
+            video_gid: None,
+            audio_gid: None,
+            has_audio: task.has_audio,
+            created_at: task.created_at,
         }
     }
 }
@@ -105,6 +207,7 @@ pub struct DownloadManager {
     config: Arc<RwLock<Config>>,
     aria2_client: Arc<RwLock<Option<Aria2Client>>>,
     aria2_process: Option<std::process::Child>,
+    task_store_path: PathBuf,
 }
 
 impl DownloadManager {
@@ -118,6 +221,8 @@ impl DownloadManager {
         if !download_path.exists() {
             let _ = std::fs::create_dir_all(&download_path);
         }
+
+        let task_store_path = Self::task_store_path();
         
         let mut manager = Self {
             tasks: Arc::new(RwLock::new(HashMap::new())),
@@ -127,21 +232,86 @@ impl DownloadManager {
             config,
             aria2_client: Arc::new(RwLock::new(None)),
             aria2_process: None,
+            task_store_path,
         };
+
+        manager.load_tasks();
         
         manager.start_aria2();
         manager.connect_aria2();
         
         let tasks = manager.tasks.clone();
         let aria2_client = manager.aria2_client.clone();
+        let task_store_path = manager.task_store_path.clone();
         runtime.spawn(async move {
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                Self::update_all_status(tasks.clone(), aria2_client.clone()).await;
+                Self::update_all_status(tasks.clone(), aria2_client.clone(), task_store_path.clone()).await;
             }
         });
         
         manager
+    }
+
+    fn task_store_path() -> PathBuf {
+        if let Some(config_dir) = dirs::config_dir() {
+            let app_config = config_dir.join("bilibili-down");
+            let _ = std::fs::create_dir_all(&app_config);
+            return app_config.join("tasks.json");
+        }
+
+        std::env::current_exe()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .parent()
+            .unwrap_or(&PathBuf::from("."))
+            .join("tasks.json")
+    }
+
+    fn load_tasks(&mut self) {
+        if !self.task_store_path.exists() {
+            return;
+        }
+
+        let Ok(content) = std::fs::read_to_string(&self.task_store_path) else {
+            return;
+        };
+        let Ok(saved_tasks) = serde_json::from_str::<Vec<PersistedDownloadTask>>(&content) else {
+            return;
+        };
+
+        let mut tasks = self.tasks.write();
+        for saved_task in saved_tasks {
+            let task: DownloadTask = saved_task.into();
+            tasks.insert(task.id.clone(), Arc::new(RwLock::new(task)));
+        }
+    }
+
+    fn save_tasks(&self) {
+        Self::save_tasks_to_path(&self.tasks, &self.task_store_path);
+    }
+
+    fn save_tasks_to_path(
+        tasks: &Arc<RwLock<HashMap<String, Arc<RwLock<DownloadTask>>>>>,
+        task_store_path: &PathBuf,
+    ) {
+        let mut snapshot: Vec<PersistedDownloadTask> = tasks
+            .read()
+            .values()
+            .map(|task| {
+                let task = task.read();
+                PersistedDownloadTask::from(&*task)
+            })
+            .collect();
+
+        snapshot.sort_by_key(|task| task.created_at);
+
+        if let Some(parent) = task_store_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        if let Ok(content) = serde_json::to_string_pretty(&snapshot) {
+            let _ = std::fs::write(task_store_path, content);
+        }
     }
     
     #[cfg(target_os = "windows")]
@@ -280,7 +450,8 @@ impl DownloadManager {
     
     async fn update_all_status(
         tasks: Arc<RwLock<HashMap<String, Arc<RwLock<DownloadTask>>>>>,
-        aria2_client: Arc<RwLock<Option<Aria2Client>>>
+        aria2_client: Arc<RwLock<Option<Aria2Client>>>,
+        task_store_path: PathBuf,
     ) {
         let client = {
             let guard = aria2_client.read();
@@ -291,6 +462,7 @@ impl DownloadManager {
             let task_list: Vec<(String, Arc<RwLock<DownloadTask>>)> = {
                 tasks.read().iter().map(|(id, task)| (id.clone(), task.clone())).collect()
             };
+            let mut changed = false;
             
             for (_id, task) in task_list.iter() {
                 let (video_gid, audio_gid, has_audio) = {
@@ -396,8 +568,10 @@ impl DownloadManager {
                         
                         if has_error {
                             *status_arc.write() = DownloadStatus::Failed(error_msg);
+                            changed = true;
                         } else if all_complete && video_progress >= 1.0 && audio_progress >= 1.0 {
                             *status_arc.write() = DownloadStatus::Merging { progress: 0.5 };
+                            changed = true;
                         } else {
                             let total_progress = if has_audio {
                                 (video_progress + audio_progress) / 2.0
@@ -414,6 +588,10 @@ impl DownloadManager {
                     }
                     _ => {}
                 }
+            }
+
+            if changed {
+                Self::save_tasks_to_path(&tasks, &task_store_path);
             }
         }
     }
@@ -469,46 +647,6 @@ impl DownloadManager {
         tools_path
     }
     
-    fn get_ffmpeg_path() -> PathBuf {
-        let exe_dir = std::env::current_exe()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .parent()
-            .unwrap_or(&PathBuf::from("."))
-            .to_path_buf();
-        
-        #[cfg(target_os = "windows")]
-        let ffmpeg_name = "ffmpeg.exe";
-        #[cfg(not(target_os = "windows"))]
-        let ffmpeg_name = "ffmpeg";
-        
-        // 先检查 tools 目录
-        let tools_path = exe_dir.join("tools").join(ffmpeg_name);
-        if tools_path.exists() {
-            return tools_path;
-        }
-        
-        // 再检查可执行文件旁边
-        let beside_path = exe_dir.join(ffmpeg_name);
-        if beside_path.exists() {
-            return beside_path;
-        }
-        
-        // 非 Windows 平台：尝试从 PATH 中查找
-        #[cfg(not(target_os = "windows"))]
-        {
-            if let Ok(output) = Command::new("which").arg("ffmpeg").output() {
-                if output.status.success() {
-                    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    if !path.is_empty() {
-                        return PathBuf::from(path);
-                    }
-                }
-            }
-        }
-        
-        tools_path
-    }
-    
     pub fn get_config(&self) -> Arc<RwLock<Config>> {
         self.config.clone()
     }
@@ -517,14 +655,17 @@ impl DownloadManager {
         let task_id = task.id.clone();
         let task = Arc::new(RwLock::new(task));
         self.tasks.write().insert(task_id.clone(), task.clone());
+        self.save_tasks();
         
         let download_path = self.download_path.clone();
         let bilibili_api = self.bilibili_api.clone();
         let aria2_client = self.aria2_client.clone();
+        let tasks = self.tasks.clone();
+        let task_store_path = self.task_store_path.clone();
         
         self.runtime.spawn(async move {
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-            Self::download_task(task, download_path, bilibili_api, aria2_client).await;
+            Self::download_task(task, download_path, bilibili_api, aria2_client, tasks, task_store_path).await;
         });
     }
     
@@ -533,6 +674,8 @@ impl DownloadManager {
         download_path: PathBuf,
         bilibili_api: Arc<BilibiliApi>,
         aria2_client: Arc<RwLock<Option<Aria2Client>>>,
+        tasks: Arc<RwLock<HashMap<String, Arc<RwLock<DownloadTask>>>>>,
+        task_store_path: PathBuf,
     ) {
         let (id, title, is_mp3, quality, cid) = {
             let t = task.read();
@@ -545,6 +688,7 @@ impl DownloadManager {
             progress: 0.0,
             speed: "获取下载地址...".to_string(),
         };
+        Self::save_tasks_to_path(&tasks, &task_store_path);
         
         debug_println!("正在获取视频下载地址...");
         match bilibili_api.get_download_urls(&id, cid, quality).await {
@@ -562,6 +706,7 @@ impl DownloadManager {
                 
                 let has_audio = video_url != audio_url;
                 task.write().has_audio = has_audio;
+                Self::save_tasks_to_path(&tasks, &task_store_path);
                 
                 let mut retry_count = 0;
                 while aria2_client.read().is_none() && retry_count < 10 {
@@ -604,6 +749,7 @@ impl DownloadManager {
                             debug_println!("视频下载任务已添加，GID: {}", gid);
                             task.write().video_gid = Some(gid.clone());
                             task.write().video_path = Some(video_file.clone());
+                            Self::save_tasks_to_path(&tasks, &task_store_path);
                             
                             if has_audio {
                                 let mut audio_options = options.clone();
@@ -615,10 +761,12 @@ impl DownloadManager {
                                         debug_println!("音频下载任务已添加，GID: {}", audio_gid);
                                         task.write().audio_gid = Some(audio_gid.clone());
                                         task.write().audio_path = Some(audio_file.clone());
+                                        Self::save_tasks_to_path(&tasks, &task_store_path);
                                     }
                                     Err(e) => {
                                         debug_eprintln!("添加音频下载失败: {}", e);
                                         *task.write().status.write() = DownloadStatus::Failed(format!("添加音频下载失败: {}", e));
+                                        Self::save_tasks_to_path(&tasks, &task_store_path);
                                         return;
                                     }
                                 }
@@ -634,6 +782,7 @@ impl DownloadManager {
                                         break;
                                     }
                                     DownloadStatus::Failed(_) => {
+                                        Self::save_tasks_to_path(&tasks, &task_store_path);
                                         return;
                                     }
                                     _ => {}
@@ -655,74 +804,60 @@ impl DownloadManager {
                                 
                                 task.write().output_path = Some(output_file);
                                 *task.write().status.write() = DownloadStatus::Completed;
+                                Self::save_tasks_to_path(&tasks, &task_store_path);
                             } else {
                                 debug_eprintln!("合并文件失败");
                                 *task.write().status.write() = DownloadStatus::Failed("合并音视频失败".to_string());
+                                Self::save_tasks_to_path(&tasks, &task_store_path);
                             }
                         }
                         Err(e) => {
                             debug_eprintln!("添加视频下载任务失败: {}", e);
                             *task.write().status.write() = DownloadStatus::Failed(format!("添加下载失败: {}", e));
+                            Self::save_tasks_to_path(&tasks, &task_store_path);
                         }
                     }
                 } else {
                     debug_eprintln!("aria2客户端未连接");
                     *task.write().status.write() = DownloadStatus::Failed("aria2客户端未连接".to_string());
+                    Self::save_tasks_to_path(&tasks, &task_store_path);
                 }
             }
             Err(e) => {
                 debug_eprintln!("获取下载地址失败: {}", e);
                 *task.write().status.write() = DownloadStatus::Failed(format!("获取下载地址失败: {}", e));
+                Self::save_tasks_to_path(&tasks, &task_store_path);
             }
         }
     }
     
     async fn merge_audio_video(video_path: &PathBuf, audio_path: &PathBuf, output_path: &PathBuf, is_mp3: bool) -> bool {
-        let ffmpeg_path = Self::get_ffmpeg_path();
-        
-        if !ffmpeg_path.exists() {
-            debug_eprintln!("ffmpeg未找到: {:?}", ffmpeg_path);
-            return false;
-        }
-        
-        debug_println!("使用ffmpeg合并文件...");
-        
-        let mut cmd = Command::new(ffmpeg_path);
-        
         if is_mp3 {
-            cmd.arg("-i").arg(audio_path.to_string_lossy().to_string())
-                .arg("-vn")
-                .arg("-acodec").arg("mp3")
-                .arg("-ab").arg("320k");
-        } else {
-            cmd.arg("-i").arg(video_path.to_string_lossy().to_string())
-                .arg("-i").arg(audio_path.to_string_lossy().to_string())
-                .arg("-c").arg("copy");
-        }
-        
-        cmd.arg("-y")
-            .arg(output_path.to_string_lossy().to_string());
-        
-        #[cfg(target_os = "windows")]
-        {
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-        
-        match cmd.output() {
-            Ok(output) => {
-                if output.status.success() {
-                    debug_println!("ffmpeg合并成功");
+            debug_println!("使用媒体处理 DLL 转换 MP3...");
+            return match crate::media_dll::audio_to_mp3(audio_path, output_path, 320) {
+                Ok(()) => {
+                    debug_println!("MP3 转换成功");
                     true
-                } else {
-                    debug_eprintln!("ffmpeg执行失败: {}", String::from_utf8_lossy(&output.stderr));
+                }
+                Err(_e) => {
+                    debug_eprintln!("MP3 转换失败: {}", _e);
                     false
                 }
+            };
+        }
+
+        debug_println!("使用内嵌 MP4 muxer 合并文件...");
+        return match crate::mp4_muxer::mux_m4s_to_mp4(video_path, audio_path, output_path) {
+            Ok(()) => {
+                debug_println!("MP4 合并成功");
+                true
             }
             Err(_e) => {
-                debug_eprintln!("运行ffmpeg失败: {}", _e);
+                debug_eprintln!("MP4 合并失败: {}", _e);
                 false
             }
-        }
+        };
+
     }
     
     fn sanitize_filename(filename: &str) -> String {
@@ -742,7 +877,9 @@ impl DownloadManager {
     }
     
     pub fn get_tasks(&self) -> Vec<Arc<RwLock<DownloadTask>>> {
-        self.tasks.read().values().cloned().collect()
+        let mut tasks: Vec<_> = self.tasks.read().values().cloned().collect();
+        tasks.sort_by_key(|task| task.read().created_at);
+        tasks
     }
     
     pub fn pause_task(&self, id: &str) {
@@ -770,15 +907,46 @@ impl DownloadManager {
             });
             
             *task.write().status.write() = DownloadStatus::Paused;
+            self.save_tasks();
         }
     }
     
     pub fn resume_task(&self, id: &str) {
         if let Some(task) = self.tasks.read().get(id) {
-            let (video_gid, audio_gid) = {
+            let (video_gid, audio_gid, should_restart) = {
                 let task_read = task.read();
-                (task_read.video_gid.clone(), task_read.audio_gid.clone())
+                let status = task_read.status.read().clone();
+                (
+                    task_read.video_gid.clone(),
+                    task_read.audio_gid.clone(),
+                    matches!(status, DownloadStatus::Failed(_)) || (task_read.video_gid.is_none() && task_read.audio_gid.is_none()),
+                )
             };
+
+            if should_restart {
+                {
+                    let mut task_write = task.write();
+                    task_write.video_gid = None;
+                    task_write.audio_gid = None;
+                    task_write.video_path = None;
+                    task_write.audio_path = None;
+                    *task_write.status.write() = DownloadStatus::Waiting;
+                }
+                self.save_tasks();
+
+                let task = task.clone();
+                let download_path = self.download_path.clone();
+                let bilibili_api = self.bilibili_api.clone();
+                let aria2_client = self.aria2_client.clone();
+                let tasks = self.tasks.clone();
+                let task_store_path = self.task_store_path.clone();
+
+                self.runtime.spawn(async move {
+                    Self::download_task(task, download_path, bilibili_api, aria2_client, tasks, task_store_path).await;
+                });
+
+                return;
+            }
             
             let aria2_client = self.aria2_client.clone();
             self.runtime.spawn(async move {
@@ -801,6 +969,7 @@ impl DownloadManager {
                 progress: 0.0,
                 speed: "恢复中...".to_string(),
             };
+            self.save_tasks();
         }
     }
     
@@ -830,6 +999,7 @@ impl DownloadManager {
         }
         
         self.tasks.write().remove(id);
+        self.save_tasks();
     }
 }
 

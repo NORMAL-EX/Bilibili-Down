@@ -53,7 +53,7 @@ bilibili-down/
 ├── config.json      # 配置文件（首次运行自动生成）
 └── tools/
    ├── aria2c       # 下载工具（已包含）
-   └── ffmpeg       # 视频处理工具（已包含）
+   └── ffmpeg.dll  # 可选：MP3 转码插件
 ```
 
 ## 📖 使用说明
@@ -148,7 +148,7 @@ src/
 - **异步运行时**: [tokio](https://tokio.rs/) - 异步运行时
 - **序列化**: [serde](https://serde.rs/) - JSON序列化
 - **下载引擎**: [aria2](https://aria2.github.io/) - 多线程下载
-- **视频处理**: [FFmpeg](https://ffmpeg.org/) - 音视频处理
+- **视频处理**: 内嵌 MP4 muxer - 视频合并；可选媒体 DLL - MP3 转码
 
 ## 🤝 贡献
 
@@ -188,7 +188,7 @@ src/
 
 - [egui](https://github.com/emilk/egui) - 优秀的 GUI 框架
 - [aria2](https://aria2.github.io/) - 强大的下载工具
-- [FFmpeg](https://ffmpeg.org/) - 专业的音视频处理
+- 内嵌 MP4 muxer - 视频合并处理
 - [dddffgg](https://github.com/NORMAL-EX) - 软件开发及 1080P 分辨率视频免登录解析技术支持
 - [hwyyds-skidder-team](https://github.com/hwyyds-skidder-team) - 720P 分辨率视频免登录解析技术支持
 - 所有贡献者和用户的支持

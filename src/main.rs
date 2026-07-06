@@ -6,6 +6,8 @@ mod config;
 mod downloader;
 mod bilibili;
 mod ui;
+mod mp4_muxer;
+mod media_dll;
 
 use eframe::egui;
 

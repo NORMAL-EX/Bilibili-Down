@@ -1,6 +1,6 @@
 [package]
 name = "bilibili-down"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 
 [package.metadata.winresource]
@@ -36,6 +36,7 @@ arboard = "3.4"
 lazy_static = "1.4"
 urlencoding = "2.1"
 winit = "0.29"
+libloading = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"

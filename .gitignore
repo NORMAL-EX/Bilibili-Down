@@ -1,0 +1,6 @@
+/target/
+/local-test-package/
+/local-mux-debug/
+/tools/*.exp
+/tools/*.lib
+/tools/*.pdb

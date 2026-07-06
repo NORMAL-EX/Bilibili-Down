@@ -53,7 +53,7 @@ bilibili-down/
 ├── config.json     # Configuration file (auto-generated)
 └── tools/
    ├── aria2c       # Download tool (included)
-   └── ffmpeg       # Video processing tool (included)
+   └── ffmpeg.dll  # Optional: MP3 conversion plugin
 ```
 
 ## 📖 Usage Guide
@@ -148,7 +148,7 @@ src/
 - **Async Runtime**: [tokio](https://tokio.rs/) - Async runtime
 - **Serialization**: [serde](https://serde.rs/) - JSON serialization
 - **Download Engine**: [aria2](https://aria2.github.io/) - Multi-threaded downloader
-- **Video Processing**: [FFmpeg](https://ffmpeg.org/) - Audio/video processing
+- **Video Processing**: Built-in MP4 muxer for video merge; optional media DLL for MP3 conversion
 
 ## 🤝 Contributing
 
@@ -188,7 +188,7 @@ This project is licensed under the [MIT License](./LICENSE).
 
 - [egui](https://github.com/emilk/egui) - Excellent GUI framework
 - [aria2](https://aria2.github.io/) - Powerful download tool
-- [FFmpeg](https://ffmpeg.org/) - Professional audio/video processing
+- Built-in MP4 muxer - video merge processing
 - [dddffgg](https://github.com/NORMAL-EX) - Software development and support for 1080P resolution video parsing without login
 - [hwyyds-skidder-team](https://github.com/hwyyds-skidder-team) - Support for 720P resolution video parsing without login
 - All contributors and users for their support
